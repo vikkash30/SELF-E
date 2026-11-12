@@ -1,0 +1,48 @@
+@import "tailwindcss";
+
+@theme {
+  --color-medicare-primary: #2563EB;
+  --color-medicare-primary-hover: #1D4ED8;
+  --color-medicare-primary-light: #EFF6FF;
+  --color-medicare-navy: #142D4E;
+  --color-medicare-navy-dark: #0B1B30;
+  --color-medicare-navy-light: #1E3A5F;
+  --color-medicare-bg: #F8FAFC;
+  --color-medicare-success: #16A34A;
+  --color-medicare-success-light: #F0FDF4;
+  --color-medicare-warning: #D97706;
+  --color-medicare-warning-light: #FFFBEB;
+  --color-medicare-danger: #DC2626;
+  --color-medicare-danger-light: #FEF2F2;
+
+  --font-sans: 'Plus Jakarta Sans', 'Inter', system-ui, sans-serif;
+  --font-heading: 'Plus Jakarta Sans', system-ui, sans-serif;
+}
+
+:root {
+  font-family: 'Plus Jakarta Sans', 'Inter', system-ui, -apple-system, sans-serif;
+  color-scheme: light;
+}
+
+body {
+  background-color: #F8FAFC;
+  color: #142D4E;
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Custom subtle scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #CBD5E1;
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94A3B8;
+}

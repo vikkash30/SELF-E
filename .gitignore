@@ -1,0 +1,42 @@
+# Environment variables and secrets
+.env
+.env.*
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+*.env
+credentials.json
+serviceAccountKey.json
+*.db
+*.sqlite
+*.sqlite3
+
+# Dependencies
+node_modules/
+.venv/
+venv/
+env/
+ENV/
+
+# Build outputs
+dist/
+build/
+out/
+
+# Python cache and testing
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editor and system files
+.qodo/
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

@@ -1,0 +1,17 @@
+# Backend environment and secrets
+.env
+.env.*
+.env.local
+credentials.json
+serviceAccountKey.json
+
+# Python virtual environment
+.venv/
+venv/
+env/
+
+# Python cache & test
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
