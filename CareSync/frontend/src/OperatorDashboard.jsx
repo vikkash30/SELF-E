@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { BCP47_LANGUAGE_TAGS } from './i18n.js';
 import { JitsiMeeting } from '@jitsi/react-sdk';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
@@ -30,6 +31,7 @@ import {
   Hospital,
   Lock,
   MapPin,
+  Microscope,
   Navigation,
   Phone,
   PhoneCall,
@@ -40,8 +42,11 @@ import {
   User,
   UserPlus,
   Video,
+  Volume2,
+  VolumeX,
   Wifi,
   WifiOff,
+  Zap,
 } from 'lucide-react';
 import {
   cacheFacilitiesForSeverity,
@@ -147,6 +152,11 @@ function runOfflineVitalSafetyCheck(vitals) {
       reason: `Offline vital red-flag detected: ${reasons.join(', ')}.`,
       recommended_action:
         'Do not wait for internet sync. Call 108 ambulance and refer immediately to nearest CHC / District Hospital.',
+      clinical_suggestions: {
+        immediate_action: 'Elevate legs, provide high-flow oxygen if available, clear airway, and keep patient warm.',
+        facility_routing: 'Refer to Community Health Centre (CHC) or District Hospital via 108 ambulance.',
+        required_tests: 'Continuous SpO2 monitoring, 12-lead ECG, blood pressure series, arterial blood gas.',
+      },
       red_flags_to_watch: reasons,
       source: 'offline_vital_guard',
     };
@@ -158,9 +168,87 @@ function runOfflineVitalSafetyCheck(vitals) {
     reason: `Device is offline (SpO2 ${vitals.spo2 || '--'}%, Temp ${vitals.temperature || '--'}°F, HR ${vitals.heart_rate || '--'} bpm). Saved locally in IndexedDB.`,
     recommended_action:
       'Keep patient hydrated and monitor vitals. Visit will auto-sync to CareSync cloud when network returns.',
+    clinical_suggestions: {
+      immediate_action: 'Elevate legs if dizzy, provide oral rehydration salts (ORS), and avoid heavy physical exertion.',
+      facility_routing: 'Refer to Primary Health Centre (PHC) or schedule CareSync telemedicine doctor consultation.',
+      required_tests: 'Check random blood sugar (RBS), complete blood count (CBC), and repeat vitals.',
+    },
     red_flags_to_watch: ['SpO2 < 92%', 'Temperature > 103°F', 'Severe breathlessness'],
     source: 'offline_queue',
   };
+}
+
+function SuggestionBox({ suggestions }) {
+  const { t } = useTranslation();
+  if (!suggestions || typeof suggestions !== 'object') return null;
+
+  const immediateAction =
+    suggestions.immediate_action ||
+    'Keep patient rested, provide oral rehydration salts (ORS), and monitor vitals.';
+  const facilityRouting =
+    suggestions.facility_routing ||
+    'Refer to Primary Health Centre (PHC) or schedule CareSync telemedicine doctor consultation.';
+  const requiredTests =
+    suggestions.required_tests ||
+    'Check random blood sugar (RBS), complete blood count (CBC), and repeat vital signs.';
+
+  return (
+    <div className="mt-4 rounded-2xl border border-blue-200 bg-[#EFF6FF] p-5 text-slate-800 shadow-sm">
+      <div className="mb-3.5 flex items-center gap-2 border-b border-blue-100 pb-2.5">
+        <Sparkles className="h-4 w-4 text-blue-600" />
+        <h4 className="text-xs font-black uppercase tracking-wider text-blue-900">
+          {t('Clinical Suggestions & AI Advice') || 'Clinical Suggestions & AI Advice'}
+        </h4>
+      </div>
+
+      <div className="space-y-3">
+        {/* Immediate Action */}
+        <div className="flex items-start gap-3 rounded-xl border border-blue-100/70 bg-white/90 p-3.5 shadow-2xs">
+          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-amber-100 text-amber-700">
+            <Zap className="h-4 w-4" />
+          </div>
+          <div className="min-w-0 flex-1">
+            <p className="text-xs font-black uppercase tracking-wide text-amber-900">
+              ⚡ {t('Immediate Action') || 'Immediate Action'}
+            </p>
+            <p className="mt-0.5 text-sm font-semibold leading-snug text-slate-800">
+              {immediateAction}
+            </p>
+          </div>
+        </div>
+
+        {/* Facility Routing */}
+        <div className="flex items-start gap-3 rounded-xl border border-blue-100/70 bg-white/90 p-3.5 shadow-2xs">
+          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-blue-100 text-blue-700">
+            <Hospital className="h-4 w-4" />
+          </div>
+          <div className="min-w-0 flex-1">
+            <p className="text-xs font-black uppercase tracking-wide text-blue-900">
+              🏥 {t('Facility Routing') || 'Facility Routing'}
+            </p>
+            <p className="mt-0.5 text-sm font-semibold leading-snug text-slate-800">
+              {facilityRouting}
+            </p>
+          </div>
+        </div>
+
+        {/* Required Tests */}
+        <div className="flex items-start gap-3 rounded-xl border border-blue-100/70 bg-white/90 p-3.5 shadow-2xs">
+          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-emerald-100 text-emerald-700">
+            <Microscope className="h-4 w-4" />
+          </div>
+          <div className="min-w-0 flex-1">
+            <p className="text-xs font-black uppercase tracking-wide text-emerald-900">
+              🔬 {t('Required Tests') || 'Required Tests'}
+            </p>
+            <p className="mt-0.5 text-sm font-semibold leading-snug text-slate-800">
+              {requiredTests}
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 export default function OperatorDashboard() {
@@ -179,6 +267,9 @@ export default function OperatorDashboard() {
   // Talking Prescription State (Multi-Medicine Array - Phase 3)
   const [prescriptions, setPrescriptions] = useState([]);
   const prescription = prescriptions[0] || null;
+
+  // Phase 2: Karaoke-Style TTS Highlight State
+  const [activeAudioIndex, setActiveAudioIndex] = useState(null);
 
   // Locked hardware-fed vitals (strictly readOnly on Operator Dashboard)
   const [spo2, setSpo2] = useState('');
@@ -510,6 +601,7 @@ export default function OperatorDashboard() {
     setInCall(false);
     setActiveCallVisitId('');
     setPrescriptions([]);
+    setActiveAudioIndex(null);
     if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
       window.speechSynthesis.cancel();
     }
@@ -539,6 +631,179 @@ export default function OperatorDashboard() {
       }
     } catch {
       // Ignore network errors while clearing session.
+    }
+  }
+
+  // Phase 2: Karaoke-Style TTS Highlight Audio Walkthrough
+  function playPrescriptionAudio() {
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
+      alert('Browser speech synthesis is not supported in this browser.');
+      return;
+    }
+
+    if (activeAudioIndex !== null) {
+      window.speechSynthesis.cancel();
+      setActiveAudioIndex(null);
+      return;
+    }
+
+    if (!prescriptions || prescriptions.length === 0) return;
+
+    window.speechSynthesis.cancel();
+
+    const rawLang =
+      localStorage.getItem('careSyncLang') ||
+      localStorage.getItem('app_lang') ||
+      i18n.language ||
+      'en';
+    const langKey = ['en', 'hi', 'ta', 'te'].includes(rawLang) ? rawLang : 'en';
+    const bcp47 = BCP47_LANGUAGE_TAGS[langKey] || 'en-IN';
+
+    function speakNextMedicine(index) {
+      if (index >= prescriptions.length) {
+        setActiveAudioIndex(null);
+        return;
+      }
+
+      const med = prescriptions[index];
+      const name = med.medicine_name || med.medicineName || `Medicine #${index + 1}`;
+      const dos = med.dosage || '1 Tablet';
+      const food = med.food_context || med.foodContext || 'After Food';
+      const dur = med.duration || '5 Days';
+      const tRaw = med.timing;
+      const tList = Array.isArray(tRaw)
+        ? tRaw
+        : typeof tRaw === 'string'
+          ? tRaw.split(/[,&]+/).map((s) => s.trim())
+          : ['Morning'];
+
+      const timingEn = tList.join(' and ');
+      const timingHi = tList.map((tm) => t(tm)).join(' और ');
+      const timingTa = tList.map((tm) => t(tm)).join(' மற்றும் ');
+      const timingTe = tList.map((tm) => t(tm)).join(' మరియు ');
+
+      let speechText = '';
+      if (langKey === 'hi') {
+        speechText = `दवा ${index + 1}: ${t(food)}, ${timingHi}, ${name} की ${t(dos)}, ${t(dur)} लें।`;
+      } else if (langKey === 'ta') {
+        speechText = `மருந்து ${index + 1}: ${t(food)}, ${timingTa}, ${name} ${t(dos)}, ${t(dur)} எடுத்துக்கொள்ளவும்.`;
+      } else if (langKey === 'te') {
+        speechText = `మందు ${index + 1}: ${t(food)}, ${timingTe}, ${name} ${t(dos)}, ${t(dur)} తీసుకోండి.`;
+      } else {
+        speechText = `Medicine ${index + 1}: Take ${dos} of ${name} in the ${timingEn.toLowerCase()}, ${food.toLowerCase()}, for ${dur}.`;
+      }
+
+      const utterance = new SpeechSynthesisUtterance(speechText);
+      utterance.lang = bcp47;
+      utterance.rate = 0.88;
+
+      utterance.onstart = () => {
+        setActiveAudioIndex(index);
+      };
+
+      utterance.onend = () => {
+        if (index + 1 < prescriptions.length) {
+          speakNextMedicine(index + 1);
+        } else {
+          setActiveAudioIndex(null);
+        }
+      };
+
+      utterance.onerror = () => {
+        setActiveAudioIndex(null);
+      };
+
+      window.speechSynthesis.speak(utterance);
+    }
+
+    speakNextMedicine(0);
+  }
+
+  // Phase 3: The "Teach-Back" Confirmation
+  async function handleTeachBackConfirm(idx) {
+    const updated = prescriptions.map((p, i) =>
+      i === idx ? { ...p, understood: true } : p
+    );
+    setPrescriptions(updated);
+
+    const currentVisitId = activeCallVisitId || triageOutput?.visitId || String(patientId);
+
+    // 1. Update Firebase visits document
+    if (isFirebaseConfigured && currentVisitId) {
+      try {
+        await setDoc(
+          doc(firestoreDb, 'visits', String(currentVisitId)),
+          {
+            prescriptions: updated,
+            prescription: updated[0] || null,
+            updated_at: serverTimestamp(),
+          },
+          { merge: true }
+        );
+      } catch (err) {
+        console.warn('Firestore teach-back update error:', err);
+      }
+    }
+
+    // 2. Broadcast via BroadcastChannel and update localStorage for zero-latency local demo
+    try {
+      localStorage.setItem(
+        'caresync_latest_prescription',
+        JSON.stringify({
+          visit_id: currentVisitId,
+          prescriptions: updated,
+          prescription: updated[0] || null,
+        })
+      );
+      if (typeof BroadcastChannel !== 'undefined') {
+        const ch = new BroadcastChannel('caresync-prescription');
+        ch.postMessage({
+          type: 'TEACH_BACK_CONFIRMED',
+          visit_id: currentVisitId,
+          medicineIndex: idx,
+          prescriptions: updated,
+          prescription: updated[0] || null,
+        });
+        ch.close();
+      }
+    } catch {
+      // Ignore
+    }
+  }
+
+  // Phase 4: Hackathon "Demo" Button (Safety Net)
+  function handleLoadDemoCase() {
+    setPatientName('Ramesh');
+    setAge('55');
+    setGender('Male');
+    setPhoneNumber('+919994577702');
+    setCountry('India');
+    setPatientState('Tamil Nadu');
+    setCity('Coimbatore');
+    setSymptoms('Severe chest pain radiating to left arm, heavy sweating, acute shortness of breath since 2 hours.');
+    setTemperature('99.2');
+    setSpo2('91');
+    setHeartRate('114');
+    setFormError('');
+
+    const sessionPayload = {
+      patientId: 1,
+      name: 'Ramesh',
+      gender: 'Male',
+      country: 'India',
+      state: 'Tamil Nadu',
+      city: 'Coimbatore',
+    };
+
+    try {
+      localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(sessionPayload));
+      if (typeof BroadcastChannel !== 'undefined') {
+        const ch = new BroadcastChannel(SESSION_CHANNEL_NAME);
+        ch.postMessage({ type: 'SESSION_UPDATE', session: sessionPayload });
+        ch.close();
+      }
+    } catch {
+      // Ignore
     }
   }
 
@@ -607,7 +872,7 @@ export default function OperatorDashboard() {
       const currentLangCode =
         localStorage.getItem('careSyncLang') || localStorage.getItem('app_lang') || 'ta';
 
-      const response = await fetch(`${API_BASE_URL}/triage`, {
+      const fetchOptions = {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -622,7 +887,12 @@ export default function OperatorDashboard() {
           vitals: vitalsPayload,
           language: currentLangCode,
         }),
-      });
+      };
+      if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) {
+        fetchOptions.signal = AbortSignal.timeout(10000);
+      }
+
+      const response = await fetch(`${API_BASE_URL}/triage`, fetchOptions);
 
       if (!response.ok) {
         throw new Error(`Server returned HTTP ${response.status}`);
@@ -646,28 +916,36 @@ export default function OperatorDashboard() {
         }
       }
 
+      const payload = {
+        visit_id: docId,
+        patient_id: patientId,
+        patient_name: visitBase.patientName,
+        patientName: visitBase.patientName,
+        phoneNumber: visitBase.phoneNumber,
+        phone_number: visitBase.phoneNumber,
+        gender: visitBase.gender,
+        age: visitBase.age,
+        country: visitBase.country,
+        state: visitBase.state,
+        city: visitBase.city,
+        symptoms: visitBase.symptoms,
+        vitals: vitalsPayload,
+        triage_result: result,
+        status: 'triaged',
+        created_at: new Date().toISOString(),
+        updated_at: serverTimestamp(),
+      };
+
+      console.log("Saving to Firebase:", payload);
       if (isFirebaseConfigured) {
-        await setDoc(
-          doc(firestoreDb, 'visits', docId),
-          {
-            visit_id: docId,
-            patient_id: patientId,
-            patient_name: visitBase.patientName,
-            phoneNumber: visitBase.phoneNumber,
-            phone_number: visitBase.phoneNumber,
-            gender: visitBase.gender,
-            age: visitBase.age,
-            country: visitBase.country,
-            state: visitBase.state,
-            city: visitBase.city,
-            symptoms: visitBase.symptoms,
-            vitals: vitalsPayload,
-            triage_result: result,
-            status: 'triaged',
-            updated_at: serverTimestamp(),
-          },
-          { merge: true }
-        );
+        try {
+          await Promise.race([
+            setDoc(doc(firestoreDb, 'visits', docId), payload, { merge: true }),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore timeout')), 1500)),
+          ]);
+        } catch (err) {
+          console.warn('Direct Firestore setDoc write error:', err);
+        }
       }
 
       await cacheFacilitiesForSeverity(result.severity, recommended);
@@ -682,6 +960,7 @@ export default function OperatorDashboard() {
         localId: savedLocal.localId,
         mode: 'online',
         patientName: visitBase.patientName,
+        phoneNumber: visitBase.phoneNumber,
         gender: visitBase.gender,
         age: visitBase.age,
         country: visitBase.country,
@@ -730,17 +1009,21 @@ export default function OperatorDashboard() {
 
     await updateLocalVisitStatus(triageOutput.localId, targetStatus);
 
-    const statusPayload = {
+    const payload = {
       visit_id: visitId,
       patient_id: patientId,
       status: targetStatus,
-      patient_name: triageOutput.patientName,
-      gender: triageOutput.gender || gender,
-      age: triageOutput.age,
-      country: triageOutput.country || country,
-      state: triageOutput.state || patientState,
-      city: triageOutput.city || city,
-      symptoms: triageOutput.symptoms,
+      patient_name: patientName.trim() || triageOutput.patientName || 'Patient',
+      patientName: patientName.trim() || triageOutput.patientName || 'Patient',
+      phoneNumber: phoneNumber.trim() || triageOutput.phoneNumber || '',
+      phone_number: phoneNumber.trim() || triageOutput.phoneNumber || '',
+      language: 'Tamil',
+      gender: gender || triageOutput.gender,
+      age: Number(age) || triageOutput.age,
+      country: country || triageOutput.country,
+      state: patientState || triageOutput.state,
+      city: city || triageOutput.city,
+      symptoms: symptoms.trim() || triageOutput.symptoms || '',
       vitals: triageOutput.vitals,
       prescription: prescription || triageOutput.prescription || undefined,
       triage_result: {
@@ -754,27 +1037,32 @@ export default function OperatorDashboard() {
       },
       escalated_at: targetStatus === 'escalated' ? new Date().toISOString() : undefined,
     };
+    const statusPayload = payload;
 
-    try {
-      if (isFirebaseConfigured) {
-        await setDoc(
-          doc(firestoreDb, 'visits', visitId),
-          {
-            ...statusPayload,
-            updated_at: serverTimestamp(),
-          },
-          { merge: true }
-        );
+    console.log("Saving to Firebase:", payload);
+    if (isFirebaseConfigured) {
+      try {
+        await Promise.race([
+          setDoc(
+            doc(firestoreDb, 'visits', visitId),
+            {
+              ...payload,
+              updated_at: serverTimestamp(),
+            },
+            { merge: true }
+          ),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore timeout')), 1500)),
+        ]);
+      } catch (err) {
+        console.warn('Direct Firestore status update failed, falling back to API:', err);
       }
-    } catch (err) {
-      console.warn('Direct Firestore status update failed, falling back to API:', err);
     }
 
     try {
       await fetch(`${API_BASE_URL}/visits/${encodeURIComponent(visitId)}/status`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(statusPayload),
+        body: JSON.stringify(payload),
       });
     } catch {
       // Offline fallback handled below.
@@ -903,6 +1191,17 @@ export default function OperatorDashboard() {
               <span className="hidden sm:inline">{t('Gateway')}</span>
             </a>
 
+            {/* Phase 4: Hackathon Demo Button */}
+            <button
+              type="button"
+              onClick={handleLoadDemoCase}
+              className="inline-flex items-center gap-1.5 rounded-xl border border-amber-300 bg-amber-50 px-3 py-1.5 text-xs font-black text-amber-900 shadow-2xs hover:bg-amber-100 hover:scale-105 active:scale-95 transition"
+              title="Instantly auto-fill patient intake with a verified clinical demo case"
+            >
+              <Sparkles className="h-3.5 w-3.5 text-amber-600 animate-pulse" />
+              <span>Load Demo Case</span>
+            </button>
+
             {/* Next Patient Loop in Success Green */}
             <button
               type="button"
@@ -989,22 +1288,81 @@ export default function OperatorDashboard() {
                 transition={{ duration: 0.4 }}
                 className="space-y-4 pt-2"
               >
-                <div className="flex items-center justify-between px-1">
+                <div className="flex flex-wrap items-center justify-between gap-2 px-1">
                   <span className="flex items-center gap-1.5 text-xs font-black uppercase tracking-wider text-[#2563EB]">
                     <Sparkles className="h-4 w-4 text-[#2563EB]" />
                     Prescriptions Received from Doctor ({prescriptions.length} Medicine{prescriptions.length === 1 ? '' : 's'})
                   </span>
+                  <button
+                    type="button"
+                    onClick={playPrescriptionAudio}
+                    className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-1 text-xs font-black transition shadow-2xs ${
+                      activeAudioIndex !== null
+                        ? 'border-rose-300 bg-rose-50 text-rose-700 animate-pulse'
+                        : 'border-amber-300 bg-amber-50 text-amber-900 hover:bg-amber-100'
+                    }`}
+                  >
+                    {activeAudioIndex !== null ? (
+                      <>
+                        <VolumeX className="h-3.5 w-3.5" />
+                        <span>Stop Karaoke Audio</span>
+                      </>
+                    ) : (
+                      <>
+                        <Volume2 className="h-3.5 w-3.5 text-amber-600" />
+                        <span>Play Karaoke Audio 🔊</span>
+                      </>
+                    )}
+                  </button>
                 </div>
                 <div className="space-y-4">
-                  {prescriptions.map((med, idx) => (
-                    <PictorialPrescriptionCard
-                      key={idx}
-                      prescription={med}
-                      allPrescriptions={prescriptions}
-                      medicineIndex={idx + 1}
-                      totalMedicines={prescriptions.length}
-                    />
-                  ))}
+                  {prescriptions.map((med, idx) => {
+                    const isPlayingAudio = activeAudioIndex !== null;
+                    const isCurrentCard = idx === activeAudioIndex;
+                    const cardHighlightClasses = isCurrentCard
+                      ? 'scale-105 ring-4 ring-amber-400 shadow-xl transition-all duration-300'
+                      : isPlayingAudio
+                      ? 'opacity-50 transition-all duration-300'
+                      : 'transition-all duration-300';
+
+                    return (
+                      <div key={idx} className={`space-y-2 rounded-2xl ${cardHighlightClasses}`}>
+                        <PictorialPrescriptionCard
+                          prescription={med}
+                          allPrescriptions={prescriptions}
+                          medicineIndex={idx + 1}
+                          totalMedicines={prescriptions.length}
+                          isActiveAudio={isCurrentCard}
+                          isAudioPlaying={isPlayingAudio}
+                          onPlayAudio={playPrescriptionAudio}
+                        />
+
+                        {/* Phase 3: The "Teach-Back" Confirmation Button */}
+                        <div className="flex items-center justify-between rounded-xl border border-teal-200/80 bg-teal-50/70 p-3 shadow-2xs">
+                          <div className="flex items-center gap-2 text-xs font-bold text-teal-900">
+                            <Stethoscope className="h-4 w-4 text-teal-600 shrink-0" />
+                            <span>Patient Teach-Back Comprehension:</span>
+                          </div>
+
+                          {med.understood ? (
+                            <span className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-100 border border-emerald-300 px-3.5 py-1.5 text-xs font-black text-emerald-800 shadow-2xs">
+                              <CheckCircle2 className="h-3.5 w-3.5 text-emerald-600" />
+                              Patient Understood ✓
+                            </span>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => handleTeachBackConfirm(idx)}
+                              className="inline-flex items-center gap-1.5 rounded-lg bg-teal-600 hover:bg-teal-700 px-3.5 py-1.5 text-xs font-bold text-white shadow-sm transition active:scale-95"
+                            >
+                              <Check className="h-3.5 w-3.5" />
+                              Patient Understood ✓
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
               </motion.div>
             )}
@@ -1337,7 +1695,7 @@ export default function OperatorDashboard() {
                 className="flex w-full items-center justify-center gap-2.5 rounded-2xl bg-[#2563EB] hover:bg-[#1D4ED8] px-6 py-4 text-base font-black text-white shadow-lg shadow-blue-600/25 transition active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-60"
               >
                 <Stethoscope className="h-5 w-5" />
-                {isSubmitting ? t('Evaluating Clinical Triage with Llama 3.1 AI...') : t('Run Clinical Triage')}
+                {isSubmitting ? t('Evaluating Clinical Triage with NVIDIA Nemotron AI...') : t('Run Clinical Triage')}
               </button>
             </form>
           </AnimatedCard>
@@ -1358,7 +1716,7 @@ export default function OperatorDashboard() {
                     </div>
                     <div>
                       <h4 className="text-sm font-black text-[#142D4E]">
-                        Evaluating Clinical Risk with Llama 3.1 AI...
+                        Evaluating Clinical Risk with NVIDIA Nemotron AI...
                       </h4>
                       <p className="text-xs text-slate-500 font-medium">
                         Analyzing vital stability thresholds, demographic vulnerability, and Indian public health schemes...
@@ -1385,22 +1743,81 @@ export default function OperatorDashboard() {
                 transition={{ duration: 0.4 }}
                 className="space-y-4"
               >
-                <div className="flex items-center justify-between px-1">
+                <div className="flex flex-wrap items-center justify-between gap-2 px-1">
                   <span className="flex items-center gap-1.5 text-xs font-black uppercase tracking-wider text-[#2563EB]">
                     <Sparkles className="h-4 w-4 text-[#2563EB]" />
                     Prescriptions Received from Doctor ({prescriptions.length} Medicine{prescriptions.length === 1 ? '' : 's'})
                   </span>
+                  <button
+                    type="button"
+                    onClick={playPrescriptionAudio}
+                    className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-1 text-xs font-black transition shadow-2xs ${
+                      activeAudioIndex !== null
+                        ? 'border-rose-300 bg-rose-50 text-rose-700 animate-pulse'
+                        : 'border-amber-300 bg-amber-50 text-amber-900 hover:bg-amber-100'
+                    }`}
+                  >
+                    {activeAudioIndex !== null ? (
+                      <>
+                        <VolumeX className="h-3.5 w-3.5" />
+                        <span>Stop Karaoke Audio</span>
+                      </>
+                    ) : (
+                      <>
+                        <Volume2 className="h-3.5 w-3.5 text-amber-600" />
+                        <span>Play Karaoke Audio 🔊</span>
+                      </>
+                    )}
+                  </button>
                 </div>
                 <div className="space-y-4">
-                  {prescriptions.map((med, idx) => (
-                    <PictorialPrescriptionCard
-                      key={idx}
-                      prescription={med}
-                      allPrescriptions={prescriptions}
-                      medicineIndex={idx + 1}
-                      totalMedicines={prescriptions.length}
-                    />
-                  ))}
+                  {prescriptions.map((med, idx) => {
+                    const isPlayingAudio = activeAudioIndex !== null;
+                    const isCurrentCard = idx === activeAudioIndex;
+                    const cardHighlightClasses = isCurrentCard
+                      ? 'scale-105 ring-4 ring-amber-400 shadow-xl transition-all duration-300'
+                      : isPlayingAudio
+                      ? 'opacity-50 transition-all duration-300'
+                      : 'transition-all duration-300';
+
+                    return (
+                      <div key={idx} className={`space-y-2 rounded-2xl ${cardHighlightClasses}`}>
+                        <PictorialPrescriptionCard
+                          prescription={med}
+                          allPrescriptions={prescriptions}
+                          medicineIndex={idx + 1}
+                          totalMedicines={prescriptions.length}
+                          isActiveAudio={isCurrentCard}
+                          isAudioPlaying={isPlayingAudio}
+                          onPlayAudio={playPrescriptionAudio}
+                        />
+
+                        {/* Phase 3: The "Teach-Back" Confirmation Button */}
+                        <div className="flex items-center justify-between rounded-xl border border-teal-200/80 bg-teal-50/70 p-3 shadow-2xs">
+                          <div className="flex items-center gap-2 text-xs font-bold text-teal-900">
+                            <Stethoscope className="h-4 w-4 text-teal-600 shrink-0" />
+                            <span>Patient Teach-Back Comprehension:</span>
+                          </div>
+
+                          {med.understood ? (
+                            <span className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-100 border border-emerald-300 px-3.5 py-1.5 text-xs font-black text-emerald-800 shadow-2xs">
+                              <CheckCircle2 className="h-3.5 w-3.5 text-emerald-600" />
+                              Patient Understood ✓
+                            </span>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => handleTeachBackConfirm(idx)}
+                              className="inline-flex items-center gap-1.5 rounded-lg bg-teal-600 hover:bg-teal-700 px-3.5 py-1.5 text-xs font-bold text-white shadow-sm transition active:scale-95"
+                            >
+                              <Check className="h-3.5 w-3.5" />
+                              Patient Understood ✓
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
               </motion.div>
             )}
@@ -1452,6 +1869,9 @@ export default function OperatorDashboard() {
                     ))}
                   </div>
                 )}
+
+                {/* Structured Clinical Suggestion Box */}
+                <SuggestionBox suggestions={triageOutput.clinical_suggestions} />
 
                 {/* Eligible Government Health Programs (Smooth Cascade) */}
                 {Array.isArray(triageOutput.eligible_schemes) &&

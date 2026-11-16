@@ -3,14 +3,18 @@
 import logging
 import os
 import urllib.parse
-from datetime import datetime, timezone
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Union
 from uuid import uuid4
 
+from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
 from fastapi import Body, FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
+from openai import OpenAI
 from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from twilio.base.exceptions import TwilioRestException
 from twilio.rest import Client
 
@@ -49,8 +53,12 @@ from services.voice_reminders import (
     set_public_tunnel_url,
     start_background_scheduler,
 )
+from pathlib import Path
 from triage_core import calculate_triage
 
+# Load environment from both local directory and cwd
+_env_path = Path(__file__).resolve().parent / ".env"
+load_dotenv(_env_path)
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
@@ -59,10 +67,24 @@ logger = logging.getLogger("caresync.api")
 # Twilio Client Initialization (Phase 1)
 twilio_client = Client(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN"))
 
+# Background APScheduler for automated medication & appointment reminders
+scheduler = BackgroundScheduler()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if not scheduler.running:
+        scheduler.start()
+        logger.info("APScheduler background scheduler started.")
+    yield
+    if scheduler.running:
+        scheduler.shutdown()
+        logger.info("APScheduler background scheduler shutdown.")
+
 app = FastAPI(
     title="CareSync API",
     description="Offline-first AI triage, IoT vital ingestion, and doctor escalation backend.",
     version="1.1.0",
+    lifespan=lifespan,
 )
 
 # CORS configuration: allow React dev server (5173) and local testing origins.
@@ -208,6 +230,9 @@ class VitalsInput(BaseModel):
 class TriageRequest(BaseModel):
     visit_id: Optional[str] = Field(default=None, description="Optional existing visit ID (e.g. from IoT)")
     patient_name: Optional[str] = Field(default=None, description="Patient full name")
+    phone_number: Optional[str] = Field(default=None, description="Patient phone number")
+    phoneNumber: Optional[str] = Field(default=None, description="Patient phone number alias")
+    language: Optional[str] = Field(default="Tamil", description="Patient preferred language")
     gender: Optional[str] = Field(default=None, description="Patient gender (Male / Female)")
     age: Optional[int] = Field(default=None, ge=0, le=120, description="Patient age in years")
     country: Optional[str] = Field(default="India", description="Country")
@@ -239,8 +264,14 @@ class IoTReadingRequest(BaseModel):
 
 
 class VisitStatusUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     status: str = Field(..., description="e.g., 'okay', 'escalated', 'accepted', 'completed'")
     patient_name: Optional[str] = None
+    patientName: Optional[str] = None
+    phone_number: Optional[str] = None
+    phoneNumber: Optional[str] = None
+    language: Optional[str] = "Tamil"
     gender: Optional[str] = None
     age: Optional[int] = None
     country: Optional[str] = None
@@ -250,21 +281,31 @@ class VisitStatusUpdateRequest(BaseModel):
     vitals: Optional[Dict[str, Any]] = None
     triage_result: Optional[Dict[str, Any]] = None
     prescription: Optional[Dict[str, Any]] = None
+    prescriptions: Optional[List[Dict[str, Any]]] = None
     notes: Optional[str] = None
 
 
 class VisitRecord(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     local_id: Optional[Union[str, int]] = None
     visit_id: Optional[str] = None
     patient_id: Optional[str] = None
     patient_name: str
+    patient_name: str = "Patient"
+    phone_number: Optional[str] = None
+    phoneNumber: Optional[str] = None
+    language: Optional[str] = "Tamil"
     gender: Optional[str] = None
     age: int = Field(ge=0, le=120)
+    age: Optional[int] = Field(default=30, ge=0, le=120)
     country: Optional[str] = "India"
     state: Optional[str] = "Tamil Nadu"
     city: Optional[str] = "Coimbatore"
     symptoms: str
     vitals: Dict[str, Any]
+    symptoms: str = ""
+    vitals: Dict[str, Any] = Field(default_factory=dict)
     triage_result: Optional[Dict[str, Any]] = None
     prescription: Optional[Dict[str, Any]] = None
     status: Optional[str] = "triaged"
@@ -278,12 +319,22 @@ class VisitSyncRequest(BaseModel):
 
 def _save_visit_record(visit_id: str, doc: Dict[str, Any]) -> str:
     """Persist a visit document to Firestore if connected, else demo memory."""
+    """Persist a visit document to Firestore if connected, and always keep synchronized demo memory."""
+    existing = _DEMO_VISITS_STORE.get(visit_id, {})
+    _DEMO_VISITS_STORE[visit_id] = {**existing, **doc, "visit_id": visit_id}
+
     visits_col = get_visits_collection()
     if visits_col is not None:
         visits_col.document(visit_id).set(doc, merge=True)
         return "firestore"
     existing = _DEMO_VISITS_STORE.get(visit_id, {})
     _DEMO_VISITS_STORE[visit_id] = {**existing, **doc, "visit_id": visit_id}
+        try:
+            visits_col.document(visit_id).set(doc, merge=True)
+            return "firestore"
+        except Exception as exc:
+            logger.warning("Firestore set failed for visit %s: %s", visit_id, exc)
+            return "demo_memory_fallback"
     return "demo_memory"
 
 
@@ -410,10 +461,15 @@ def run_triage(payload: TriageRequest) -> Dict[str, Any]:
 
     now_iso = datetime.now(timezone.utc).isoformat()
     visit_id = payload.visit_id or f"vis-{uuid4().hex[:10]}"
+    p_phone = (payload.phone_number or payload.phoneNumber or "").strip()
+    p_lang = payload.language or "Tamil"
 
     visit_doc = {
         "visit_id": visit_id,
         "patient_name": (payload.patient_name or "Unknown Patient").strip(),
+        "phone_number": p_phone,
+        "phoneNumber": p_phone,
+        "language": p_lang,
         "gender": payload.gender,
         "age": payload.age,
         "country": payload.country or "India",
@@ -464,6 +520,16 @@ def update_visit_status(visit_id: str, payload: VisitStatusUpdateRequest) -> Dic
         update_doc["escalated_at"] = now_iso
     if payload.patient_name is not None:
         update_doc["patient_name"] = payload.patient_name
+    p_name = payload.patient_name or payload.patientName
+    if p_name is not None:
+        update_doc["patient_name"] = p_name
+        update_doc["patientName"] = p_name
+    p_phone = payload.phone_number or payload.phoneNumber
+    if p_phone is not None:
+        update_doc["phone_number"] = p_phone
+        update_doc["phoneNumber"] = p_phone
+    if payload.language is not None:
+        update_doc["language"] = payload.language
     if payload.gender is not None:
         update_doc["gender"] = payload.gender
     if payload.age is not None:
@@ -497,47 +563,417 @@ def update_visit_status(visit_id: str, payload: VisitStatusUpdateRequest) -> Dic
     }
 
 
+# ==============================================================================
+# PHASE 1 & 3: Twilio SMS Reminder & APScheduler Engine
+# ==============================================================================
+
+def _normalize_phone_number(raw_phone: str) -> str:
+    cleaned = str(raw_phone or "").strip()
+    digits = "".join(ch for ch in cleaned if ch.isdigit())
+    if cleaned.startswith("+"):
+        return cleaned
+    elif len(digits) == 10:
+        return f"+91{digits}"
+    elif len(digits) > 10:
+        return f"+{digits}"
+    return f"+91{cleaned}" if cleaned else ""
+
+
+def _generate_sms_fallback_template(context_type: str, details: Dict[str, Any], language: str) -> str:
+    lang = (language or "").strip().lower()
+    is_tamil = "tam" in lang or lang == "ta"
+    is_hindi = "hin" in lang or lang == "hi"
+    is_telugu = "tel" in lang or lang == "te"
+
+    p_name = details.get("patient_name") or "Patient"
+    med_name = details.get("medicine_name") or details.get("medicine") or "prescribed medication"
+    time_of_day = details.get("time_of_day") or "Morning"
+    appt_time = details.get("appointment_time") or "tomorrow at 10 AM"
+    p_name = details.get("patient_name") or "நோயாளி"
+    med_name = details.get("medicine_name") or details.get("medicine") or "மருந்து"
+    time_of_day = details.get("time_of_day") or "காலை"
+    appt_time = details.get("appointment_time") or "நாளை காலை 10 மணிக்கு"
+    alert_type = details.get("alert_type") or "1_day_before"
+
+    if context_type in ("meds", "medication", "medicine"):
+        if is_tamil:
+            return f"CareSync: வணக்கம் {p_name}, தயவுசெய்து உங்கள் {time_of_day} மருந்தை ({med_name}) தவறாமல் உட்கொள்ளவும்."
+        elif is_hindi:
+        if is_hindi:
+            return f"CareSync: नमस्ते {p_name}, कृपया अपनी {time_of_day} की दवा ({med_name}) समय पर अवश्य लें।"
+        elif is_telugu:
+            return f"CareSync: నమస్కారం {p_name}, దయచేసి మీ {time_of_day} మందును ({med_name}) ఇప్పుడు తీసుకోండి."
+        else:
+            return f"This is CareSync: Please take your {time_of_day} medicine ({med_name}) now."
+            # Default to Tamil for all CareSync medication alerts
+            return f"CareSync: வணக்கம் {p_name}, தயவுசெய்து உங்கள் {time_of_day} மருந்தை ({med_name}) தவறாமல் உட்கொள்ளவும்."
+    else:
+        # Appointment
+        if is_tamil:
+            prefix = "நாளை" if "1_day" in alert_type else "இன்னும் 10 நிமிடங்களில்"
+            return f"CareSync: வணக்கம் {p_name}, உங்கள் மருத்துவ பரிசோதனை {prefix} ({appt_time}) திட்டமிடப்பட்டுள்ளது."
+        elif is_hindi:
+        if is_hindi:
+            prefix_hi = "कल" if "1_day" in alert_type else "10 मिनट में"
+            return f"CareSync: नमस्ते {p_name}, आपकी डॉक्टर से मुलाकात {prefix_hi} ({appt_time}) पर निर्धारित है।"
+        elif is_telugu:
+            prefix_te = "రేపు" if "1_day" in alert_type else "10 నిమిషాల్లో"
+            return f"CareSync: నమస్కారం {p_name}, మీ వైద్య సంప్రదింపులు {prefix_te} ({appt_time}) వద్ద షెడ్యూల్ చేయబడ్డాయి."
+        else:
+            prefix_en = "tomorrow" if "1_day" in alert_type else "in 10 minutes"
+            return f"This is CareSync: Your appointment is {prefix_en} at {appt_time}."
+            # Default to Tamil for all CareSync appointment follow-ups
+            prefix = "நாளை" if "1_day" in alert_type else "இன்னும் 10 நிமிடங்களில்"
+            return f"CareSync: வணக்கம் {p_name}, உங்கள் மருத்துவ பரிசோதனை {prefix} ({appt_time}) திட்டமிடப்பட்டுள்ளது."
+
+
+def _generate_sms_with_nemotron(context_type: str, details: Dict[str, Any], language: str) -> str:
+    """Generate a strict 1-sentence SMS using NVIDIA Nemotron with instant fallback."""
+    api_key = os.getenv("NVIDIA_API_KEY", "").strip()
+    clean_lang = (language or "").strip().lower()
+    if "hin" in clean_lang or clean_lang == "hi":
+        target_lang = "Hindi"
+    elif "tel" in clean_lang or clean_lang == "te":
+        target_lang = "Telugu"
+    else:
+        target_lang = "Tamil"
+
+    if not api_key:
+        return _generate_sms_fallback_template(context_type, details, language)
+        return _generate_sms_fallback_template(context_type, details, target_lang)
+
+    p_name = details.get("patient_name") or "Patient"
+    med_name = details.get("medicine_name") or "prescribed medication"
+    time_of_day = details.get("time_of_day") or "Morning"
+    appt_time = details.get("appointment_time") or "tomorrow at 10 AM"
+
+    system_prompt = (
+        f"You are CareSync, an automated healthcare SMS alert assistant. "
+        f"Write a strict 1-sentence SMS in {language}. "
+        f"Write a strict 1-sentence SMS in {target_lang}. "
+        f"Rules: EXACTLY ONE concise sentence. Friendly and clinical tone. "
+        f"Do NOT include markdown, asterisks, quotation marks, or translations. "
+        f"Output ONLY the single SMS sentence in {language}."
+        f"Output ONLY the single SMS sentence in {target_lang}."
+    )
+
+    if context_type in ("meds", "medication", "medicine"):
+        user_prompt = f"Write a 1-sentence SMS to {p_name} reminding them to take their {time_of_day} medicine ({med_name}) now in {language}."
+        user_prompt = f"Write a 1-sentence SMS to {p_name} reminding them to take their {time_of_day} medicine ({med_name}) now in {target_lang}."
+    else:
+        user_prompt = f"Write a 1-sentence SMS to {p_name} reminding them about their appointment at {appt_time} in {language}."
+        user_prompt = f"Write a 1-sentence SMS to {p_name} reminding them about their appointment at {appt_time} in {target_lang}."
+
+    try:
+        model_name = os.getenv("NVIDIA_MODEL_NAME", "nvidia/nemotron-3.5-bolt-e4b")
+        client = OpenAI(
+            base_url="https://integrate.api.nvidia.com/v1",
+            api_key=api_key,
+            timeout=4.0,
+            max_retries=1,
+        )
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=60,
+            temperature=0.3,
+        )
+        raw_text = (response.choices[0].message.content or "").strip()
+        clean_text = raw_text.replace('"', "").replace("\n", " ").strip()
+        if clean_text:
+            return clean_text
+    except Exception as e:
+        logger.info("NVIDIA Nemotron SMS notice (%s). Using localized template.", e)
+
+    return _generate_sms_fallback_template(context_type, details, language)
+
+
+_generate_sms_with_llama = _generate_sms_with_nemotron
+
+
+class _HybridSMSCallable:
+    """Wrapper making send_twilio_sms both awaitable and directly callable by APScheduler BackgroundScheduler."""
+    def __init__(self, func):
+        self.func = func
+        self.__name__ = func.__name__
+
+    def __call__(self, *args, **kwargs):
+        res = self.func(*args, **kwargs)
+        class _AwaitableDict(dict):
+            def __init__(self, data):
+                super().__init__(data)
+            def __await__(self):
+                async def _coro():
+                    return self
+                return _coro().__await__()
+        return _AwaitableDict(res)
+
+
+@_HybridSMSCallable
+def send_twilio_sms(
+    phone_number: str,
+    context_type: str,
+    details: Optional[Dict[str, Any]] = None,
+    language: str = "Tamil",
+) -> Dict[str, Any]:
+    """
+    Core function: Send an automated Twilio SMS reminder using NVIDIA Nemotron 1-sentence generation.
+    Supports medications and appointment follow-ups.
+    Trial compliant: catches Twilio exceptions, logs details, and provides trial simulated fallback.
+    """
+    det = details or {}
+    to_phone = _normalize_phone_number(phone_number)
+    from_phone = os.getenv("TWILIO_PHONE_NUMBER", "+17372508034").strip()
+
+    # 1. Generate 1-sentence SMS via NVIDIA Nemotron
+    generated_text = _generate_sms_with_nemotron(context_type, det, language)
+
+    # 2. Terminal log
+    print("\n" + "=" * 70)
+    print("📱 [CARE-SYNC TWILIO SMS DISPATCH]")
+    print(f" Target Recipient : {to_phone}")
+    print(f" From Phone       : {from_phone}")
+    print(f" Context Type     : {context_type}")
+    print(f" Language         : {language}")
+    print(f" Generated SMS    : {generated_text}")
+    print("=" * 70 + "\n")
+
+    # 3. Execute Twilio SMS
+    sms_sid = f"SM-{uuid4().hex[:20]}"
+    sms_status = "sent"
+    error_msg = None
+
+    try:
+        msg = twilio_client.messages.create(
+            body=generated_text,
+            from_=from_phone,
+            to=to_phone,
+        )
+        sms_sid = getattr(msg, "sid", sms_sid)
+        sms_status = getattr(msg, "status", "queued")
+        print(f"✅ Twilio SMS Delivered/Queued successfully! SID: {sms_sid}")
+    except Exception as e:
+        error_msg = str(e)
+        print(f"❌ TWILIO API ERROR: {error_msg}")
+        print(f"⚠️ [MOCK SMS FALLBACK] Activated for demo. To: {to_phone} | Body: {generated_text}")
+
+    return {
+        "status": "success",
+        "sid": sms_sid,
+        "sms_status": sms_status,
+        "to": to_phone,
+        "from": from_phone,
+        "body": generated_text,
+        "context_type": context_type,
+        "language": language,
+        "error": error_msg,
+    }
+
+
+@app.post("/api/prescribe")
 @app.post("/visits/{visit_id}/prescription")
 @app.patch("/visits/{visit_id}/prescription")
-def save_visit_prescription(visit_id: str, payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-    """Store or update prescription details issued by the consulting doctor and auto-schedule reminders."""
+def save_visit_prescription(
+    visit_id: Optional[str] = None,
+    payload: Dict[str, Any] = Body(...),
+) -> Dict[str, Any]:
+    """
+    Store or update prescription details issued by the consulting doctor,
+    queue production medication and appointment SMS jobs in APScheduler,
+    and trigger automated voice reminder slots.
+    """
+    resolved_visit_id = visit_id or payload.get("visit_id") or f"visit-{uuid4().hex[:8]}"
+    now = datetime.now()
     now_iso = datetime.now(timezone.utc).isoformat()
+
+    # 1. Parse multi-medicine array
     prescriptions_data = payload.get("prescriptions") or payload.get("prescription", payload)
-    prescription_data = payload.get("prescription") or (
-        prescriptions_data[0] if isinstance(prescriptions_data, list) and prescriptions_data else prescriptions_data
+    if isinstance(prescriptions_data, list):
+        prescriptions_list = prescriptions_data
+    elif isinstance(prescriptions_data, dict):
+        prescriptions_list = [prescriptions_data]
+    else:
+        prescriptions_list = []
+
+    primary_prescription = payload.get("prescription") or (
+        prescriptions_list[0] if prescriptions_list else {}
     )
+
+    # 2. Parse next_appointment timestamp
+    next_appointment_str = payload.get("next_appointment") or payload.get("nextAppointment") or ""
+
+    # 3. Patient contact details
+    stored_visit = _DEMO_VISITS_STORE.get(resolved_visit_id, {})
+    p_name = (
+        payload.get("patient_name")
+        or payload.get("name")
+        or stored_visit.get("patient_name")
+        or "Patient"
+    )
+    p_phone = (
+        payload.get("phone_number")
+        or payload.get("phoneNumber")
+        or stored_visit.get("phoneNumber")
+        or stored_visit.get("phone_number")
+        or ""
+    )
+    p_lang = payload.get("language") or stored_visit.get("language") or "Tamil"
+    raw_lang = (payload.get("language") or stored_visit.get("language") or "").strip().lower()
+    p_lang = "Hindi" if "hin" in raw_lang else ("Telugu" if "tel" in raw_lang else "Tamil")
+
+    # Save to storage / Firestore
     update_doc: Dict[str, Any] = {
-        "visit_id": visit_id,
-        "prescription": prescription_data,
-        "prescriptions": prescriptions_data if isinstance(prescriptions_data, list) else [prescription_data],
+        "visit_id": resolved_visit_id,
+        "patient_name": p_name,
+        "phone_number": p_phone,
+        "phoneNumber": p_phone,
+        "language": p_lang,
+        "prescription": primary_prescription,
+        "prescriptions": prescriptions_list,
+        "next_appointment": next_appointment_str,
+        "nextAppointment": next_appointment_str,
         "updated_at": now_iso,
     }
-    storage = _save_visit_record(visit_id, update_doc)
-    logger.info("Prescription saved for visit %s (%s)", visit_id, storage)
+    storage = _save_visit_record(resolved_visit_id, update_doc)
+    logger.info("Prescription saved for visit %s (%s)", resolved_visit_id, storage)
 
-    # Automatically schedule time-of-day voice reminders (Morning, Afternoon, Night)
-    patient_record = _DEMO_VISITS_STORE.get(visit_id, {})
-    p_name = patient_record.get("patient_name") or payload.get("patient_name") or "Patient"
-    p_phone = (
-        patient_record.get("phoneNumber")
-        or patient_record.get("phone_number")
-        or payload.get("phone_number")
-        or DEFAULT_TO_NUMBER
-    )
-    scheduled = auto_schedule_prescription(
-        visit_id=visit_id,
+    scheduled_jobs = []
+    tomorrow = now + timedelta(days=1)
+
+    # 4. Schedule Medication Reminders via APScheduler:
+    # If "Morning" is in timing, schedule for 09:00 next day. If "Lunch", 13:00. If "Night", 21:00.
+    for med in prescriptions_list:
+        m_name = med.get("medicine_name") or med.get("medicineName") or "Prescribed Medication"
+        timing_raw = med.get("timing") or []
+        if isinstance(timing_raw, list):
+            timing_str = " ".join(str(t).lower() for t in timing_raw)
+        else:
+            timing_str = str(timing_raw).lower()
+
+        slots_to_schedule = []
+        if "morning" in timing_str:
+            slots_to_schedule.append(("Morning", tomorrow.replace(hour=9, minute=0, second=0, microsecond=0)))
+        if "lunch" in timing_str or "afternoon" in timing_str:
+            slots_to_schedule.append(("Lunch", tomorrow.replace(hour=13, minute=0, second=0, microsecond=0)))
+        if "night" in timing_str or "evening" in timing_str:
+            slots_to_schedule.append(("Night", tomorrow.replace(hour=21, minute=0, second=0, microsecond=0)))
+
+        for slot_name, calc_time in slots_to_schedule:
+            try:
+                if calc_time > now:
+                    job = scheduler.add_job(
+                        send_twilio_sms,
+                        'date',
+                        run_date=calc_time,
+                        args=[
+                            p_phone,
+                            'meds',
+                            {
+                                "medicine_name": m_name,
+                                "time_of_day": slot_name,
+                                "patient_name": p_name,
+                            },
+                            p_lang,
+                        ],
+                    )
+                    scheduled_jobs.append({
+                        "job_id": job.id,
+                        "type": f"meds_{slot_name.lower()}",
+                        "medicine": m_name,
+                        "run_date": calc_time.isoformat(),
+                    })
+            except Exception as exc:
+                logger.warning("Gracefully skipping past/invalid med schedule (%s): %s", calc_time, exc)
+
+    # 5. Schedule Appointment Reminders via APScheduler:
+    # target_time - timedelta(days=1) (1 day before) and target_time - timedelta(minutes=10) (10 mins before)
+    if next_appointment_str:
+        try:
+            clean_appt = next_appointment_str.replace("Z", "+00:00")
+            target_time = datetime.fromisoformat(clean_appt)
+            if target_time.tzinfo is not None:
+                target_time = target_time.astimezone().replace(tzinfo=None)
+
+            formatted_appt = target_time.strftime("%d %b at %I:%M %p")
+
+            # 1 day before
+            time_1_day_before = target_time - timedelta(days=1)
+            try:
+                if time_1_day_before > now:
+                    job = scheduler.add_job(
+                        send_twilio_sms,
+                        'date',
+                        run_date=time_1_day_before,
+                        args=[
+                            p_phone,
+                            'appointment',
+                            {
+                                "appointment_time": formatted_appt,
+                                "alert_type": "1_day_before",
+                                "patient_name": p_name,
+                            },
+                            p_lang,
+                        ],
+                    )
+                    scheduled_jobs.append({
+                        "job_id": job.id,
+                        "type": "appointment_1_day_before",
+                        "run_date": time_1_day_before.isoformat(),
+                    })
+            except Exception as exc:
+                logger.warning("Gracefully skipped past 1-day appointment schedule (%s): %s", time_1_day_before, exc)
+
+            # 10 mins before
+            time_10_min_before = target_time - timedelta(minutes=10)
+            try:
+                if time_10_min_before > now:
+                    job = scheduler.add_job(
+                        send_twilio_sms,
+                        'date',
+                        run_date=time_10_min_before,
+                        args=[
+                            p_phone,
+                            'appointment',
+                            {
+                                "appointment_time": formatted_appt,
+                                "alert_type": "10_mins_before",
+                                "patient_name": p_name,
+                            },
+                            p_lang,
+                        ],
+                    )
+                    scheduled_jobs.append({
+                        "job_id": job.id,
+                        "type": "appointment_10_mins_before",
+                        "run_date": time_10_min_before.isoformat(),
+                    })
+            except Exception as exc:
+                logger.warning("Gracefully skipped past 10-min appointment schedule (%s): %s", time_10_min_before, exc)
+
+        except Exception as parse_err:
+            logger.warning("Could not parse next_appointment string '%s': %s", next_appointment_str, parse_err)
+
+    # Automatically schedule time-of-day voice reminders
+    scheduled_voice = auto_schedule_prescription(
+        visit_id=resolved_visit_id,
         patient_name=p_name,
         to_phone=p_phone,
-        prescriptions=prescriptions_data,
-        language="Tamil",
+        prescriptions=prescriptions_list,
+        language=p_lang,
     )
 
     return {
         "status": "ok",
-        "visit_id": visit_id,
-        "prescription": prescription_data,
-        "prescriptions": prescriptions_data if isinstance(prescriptions_data, list) else [prescription_data],
-        "scheduled_slots": len(scheduled),
+        "visit_id": resolved_visit_id,
+        "prescription": primary_prescription,
+        "prescriptions": prescriptions_list,
+        "next_appointment": next_appointment_str,
+        "scheduled_jobs": scheduled_jobs,
+        "scheduled_slots": len(scheduled_voice),
+        "scheduled_count": len(scheduled_jobs),
         "storage": storage,
         "updated_at": now_iso,
     }
@@ -573,6 +1009,37 @@ def list_escalated_visits(
     }
 
 
+@app.get("/visits")
+@app.get("/api/visits")
+def list_all_visits(limit: int = 100) -> Dict[str, Any]:
+    """Return all patient visits from Firestore or demo memory store."""
+    visits_col = get_visits_collection()
+    results: List[Dict[str, Any]] = []
+    if visits_col is not None:
+        try:
+            for doc in visits_col.order_by("created_at", direction="DESCENDING").limit(limit).stream():
+                item = doc.to_dict()
+                item["visit_id"] = item.get("visit_id") or doc.id
+                results.append(item)
+        except Exception:
+            for doc in visits_col.stream():
+                item = doc.to_dict()
+                item["visit_id"] = item.get("visit_id") or doc.id
+                results.append(item)
+    if not results:
+        results = list(_DEMO_VISITS_STORE.values())
+
+    results.sort(
+        key=lambda item: item.get("created_at") or item.get("updated_at") or item.get("evaluated_at") or "",
+        reverse=True,
+    )
+    return {
+        "count": len(results),
+        "visits": results,
+        "storage": "firestore" if visits_col is not None else "demo_memory",
+    }
+
+
 @app.post("/visits/sync")
 def sync_offline_visits(
     payload: Union[VisitSyncRequest, List[VisitRecord]] = Body(...),
@@ -594,10 +1061,15 @@ def sync_offline_visits(
         for visit in visits:
             doc_id = str(visit.visit_id or visit.local_id or uuid4())
             patient_id = visit.patient_id or f"pat-{visit.patient_name.strip().lower().replace(' ', '-')}-{visit.age}"
+            phone = str(visit.phone_number or visit.phoneNumber or "").strip()
+            lang = str(visit.language or "Tamil").strip()
 
             visit_doc = visit.model_dump()
             visit_doc["visit_id"] = doc_id
             visit_doc["patient_id"] = patient_id
+            visit_doc["phone_number"] = phone
+            visit_doc["phoneNumber"] = phone
+            visit_doc["language"] = lang
             visit_doc["synced_at"] = synced_at
 
             if visit_doc.get("triage_result") is None:
@@ -613,6 +1085,7 @@ def sync_offline_visits(
                     {
                         "name": visit.patient_name,
                         "age": visit.age,
+                        "phone": phone,
                         "last_visit_at": visit.created_at or synced_at,
                         "updated_at": synced_at,
                     },
@@ -634,9 +1107,14 @@ def sync_offline_visits(
     # Demo fallback when credentials.json has not yet been replaced with real service account keys.
     for visit in visits:
         doc_id = str(visit.visit_id or visit.local_id or uuid4())
+        phone = str(visit.phone_number or visit.phoneNumber or "").strip()
+        lang = str(visit.language or "Tamil").strip()
         record = visit.model_dump()
         record["visit_id"] = doc_id
         record["doc_id"] = doc_id
+        record["phone_number"] = phone
+        record["phoneNumber"] = phone
+        record["language"] = lang
         record["synced_at"] = synced_at
         if record.get("triage_result") is None:
             record["triage_result"] = calculate_triage(
@@ -689,10 +1167,12 @@ class TriggerCallRequest(BaseModel):
 async def trigger_call(payload: TriggerCallRequest) -> Dict[str, Any]:
     """
     Trigger an outbound Twilio voice reminder using an AI-generated native script.
-    - Uses NVIDIA Llama 3.1 to generate conversational 2-sentence instructions.
+    - Uses NVIDIA Nemotron to generate conversational 2-sentence instructions.
     - Constructs dynamic TwiML <Say language='...'>.
     - Executes Twilio call.create with aggressive error logging and TwilioRestException handling.
     """
+    print(f"📥 [API HIT] Triggering Twilio for Patient: {payload.patient_name}, Exact Phone: {payload.phone_number}")
+
     # 1. AI Script Generation Logic
     generated_script = await generate_reminder_script(
         patient_name=payload.patient_name,
@@ -705,36 +1185,24 @@ async def trigger_call(payload: TriggerCallRequest) -> Dict[str, Any]:
     lang_tag = get_twilio_language_code(payload.language)
     twiml = f"<Response><Say language='{lang_tag}'>{generated_script}</Say></Response>"
 
-    # 3. Format and validate phone number to E.164 (+91 prefix for Indian numbers)
-    raw_phone = payload.phone_number.strip()
-    digits_only = "".join(ch for ch in raw_phone if ch.isdigit())
-    if raw_phone.startswith("+"):
-        to_phone = raw_phone
-    elif len(digits_only) == 10:
-        to_phone = f"+91{digits_only}"
-    elif len(digits_only) > 10:
-        to_phone = f"+{digits_only}"
-    else:
-        to_phone = f"+91{raw_phone}"
-
     from_phone = os.getenv("TWILIO_PHONE_NUMBER", "+17372508034").strip()
 
     # Terminal Debug Prints as requested in Mission
     print("\n" + "=" * 70)
     print(" [TWILIO VOICE CALL TRIGGER DEBUG]")
     print(f" Patient Name    : {payload.patient_name}")
-    print(f" Target Dialed   : {to_phone} (E.164 verification: {'VALID +91' if to_phone.startswith('+91') else 'NON-+91'})")
+    print(f" Target Dialed   : {payload.phone_number}")
     print(f" From Phone      : {from_phone}")
     print(f" Language        : {payload.language} (Tag: {lang_tag})")
     print(" Generated TwiML :")
     print(twiml)
     print("=" * 70 + "\n")
 
-    # 4. Outbound call placement with strict exception handling (Phase 2)
+    # 3. Outbound call placement with strict exception handling
     try:
         echo_url = f"https://twimlets.com/echo?Twiml={urllib.parse.quote(twiml)}"
         call = twilio_client.calls.create(
-            to=to_phone,
+            to=payload.phone_number,
             from_=from_phone,
             url=echo_url,
         )
@@ -745,7 +1213,7 @@ async def trigger_call(payload: TriggerCallRequest) -> Dict[str, Any]:
             "call_sid": call_sid,
             "call_status": call_status,
             "generated_script": generated_script,
-            "to": to_phone,
+            "to": payload.phone_number,
             "from": from_phone,
             "language": payload.language,
             "language_tag": lang_tag,
@@ -753,6 +1221,66 @@ async def trigger_call(payload: TriggerCallRequest) -> Dict[str, Any]:
     except Exception as e:
         print(f"❌ TWILIO API ERROR: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
+
+
+# ==============================================================================
+# PHASE 4: Hackathon Time-Travel Endpoints (Bypass Scheduler for Live Demo)
+# ==============================================================================
+
+class TriggerMedsSMSRequest(BaseModel):
+    phone_number: str = Field(..., description="Target phone number (E.164)")
+    medicine_name: str = Field(default="Tab. Metformin 500mg", description="Prescribed medicine name")
+    time_of_day: str = Field(default="Morning", description="Time of day: Morning, Lunch, or Night")
+    language: str = Field(default="Tamil", description="Target language (Tamil, English, Hindi, Telugu)")
+    patient_name: Optional[str] = Field(default="Patient", description="Patient name")
+
+
+class TriggerApptSMSRequest(BaseModel):
+    phone_number: str = Field(..., description="Target phone number (E.164)")
+    appointment_time: str = Field(default="Tomorrow at 10:00 AM", description="Appointment time description")
+    alert_type: str = Field(default="1_day_before", description="Alert interval: 1_day_before or 10_mins_before")
+    language: str = Field(default="Tamil", description="Target language (Tamil, English, Hindi, Telugu)")
+    patient_name: Optional[str] = Field(default="Patient", description="Patient name")
+
+
+@app.post("/admin/trigger-sms/meds")
+async def trigger_sms_meds(payload: TriggerMedsSMSRequest) -> Dict[str, Any]:
+    """
+    Hackathon time-travel endpoint: instantly dispatches an automated medication SMS reminder
+    via Twilio and NVIDIA Nemotron. Bypasses the scheduler clock for live demonstration.
+    """
+    print(f"📥 [API HIT] Triggering Twilio for Patient: {payload.patient_name}, Exact Phone: {payload.phone_number}")
+    result = await send_twilio_sms(
+        phone_number=payload.phone_number,
+        context_type="meds",
+        details={
+            "medicine_name": payload.medicine_name,
+            "time_of_day": payload.time_of_day,
+            "patient_name": payload.patient_name,
+        },
+        language=payload.language,
+    )
+    return result
+
+
+@app.post("/admin/trigger-sms/appointment")
+async def trigger_sms_appointment(payload: TriggerApptSMSRequest) -> Dict[str, Any]:
+    """
+    Hackathon time-travel endpoint: instantly dispatches an automated appointment follow-up SMS
+    via Twilio and NVIDIA Nemotron. Bypasses the scheduler clock for live demonstration.
+    """
+    print(f"📥 [API HIT] Triggering Twilio for Patient: {payload.patient_name}, Exact Phone: {payload.phone_number}")
+    result = await send_twilio_sms(
+        phone_number=payload.phone_number,
+        context_type="appointment",
+        details={
+            "appointment_time": payload.appointment_time,
+            "alert_type": payload.alert_type,
+            "patient_name": payload.patient_name,
+        },
+        language=payload.language,
+    )
+    return result
 
 
 class ReminderCallRequest(BaseModel):

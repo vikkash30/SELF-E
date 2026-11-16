@@ -496,6 +496,8 @@ def execute_scheduled_call_sync(schedule_id: str, is_manual: bool = True) -> Dic
     slot = target.get("time_slot") or "morning"
     food = target.get("food_context") or "After Food"
     lang = target.get("language") or "Tamil"
+    clean_l = (target.get("language") or "").strip().lower()
+    lang = "Hindi" if "hin" in clean_l else ("Telugu" if "tel" in clean_l else "Tamil")
 
     # 1. Generate Contextual Native Script
     script = get_contextual_fallback_script(

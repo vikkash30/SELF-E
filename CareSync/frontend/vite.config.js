@@ -55,22 +55,47 @@ export default defineConfig({
       '/reminders': {
         target: 'http://localhost:8000',
         changeOrigin: true,
+        bypass: (req) => {
+          if (req.headers.accept && req.headers.accept.includes('text/html')) {
+            return '/index.html';
+          }
+        },
       },
       '/admin': {
         target: 'http://localhost:8000',
         changeOrigin: true,
+        bypass: (req) => {
+          if (req.headers.accept && req.headers.accept.includes('text/html')) {
+            return '/index.html';
+          }
+        },
       },
       '/triage': {
         target: 'http://localhost:8000',
         changeOrigin: true,
+        bypass: (req) => {
+          if (req.headers.accept && req.headers.accept.includes('text/html')) {
+            return '/index.html';
+          }
+        },
       },
       '/facilities': {
         target: 'http://localhost:8000',
         changeOrigin: true,
+        bypass: (req) => {
+          if (req.headers.accept && req.headers.accept.includes('text/html')) {
+            return '/index.html';
+          }
+        },
       },
       '/visits': {
         target: 'http://localhost:8000',
         changeOrigin: true,
+        bypass: (req) => {
+          if (req.headers.accept && req.headers.accept.includes('text/html')) {
+            return '/index.html';
+          }
+        },
       },
       '/twiml': {
         target: 'http://localhost:8000',

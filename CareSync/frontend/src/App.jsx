@@ -15,8 +15,9 @@ export default function App() {
         <Route path="/operator" element={<OperatorDashboard />} />
         <Route path="/doctor" element={<DoctorDashboard />} />
         <Route path="/iot" element={<IoTSimulator />} />
-        <Route path="/reminders" element={<VoiceRemindersPage />} />
+        <Route path="/reminders" element={<ReminderDashboard />} />
         <Route path="/admin/reminders" element={<ReminderDashboard />} />
+        <Route path="/voice-reminders" element={<VoiceRemindersPage />} />
         <Route path="*" element={<OperatorDashboard />} />
       </Routes>
     </BrowserRouter>

@@ -1,4 +1,4 @@
-"""NVIDIA Llama 3.1 AI Voice Reminder Script Generator with Time-of-Day & Food-Context Awareness."""
+"""NVIDIA Nemotron AI Voice Reminder Script Generator with Time-of-Day & Food-Context Awareness."""
 
 import asyncio
 from datetime import datetime
@@ -11,7 +11,7 @@ from openai import AsyncOpenAI, OpenAI
 logger = logging.getLogger("caresync.reminder_core")
 
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
-NVIDIA_MODEL_NAME = "meta/llama-3.1-8b-instruct"
+NVIDIA_MODEL_NAME = os.getenv("NVIDIA_MODEL_NAME", "nvidia/nemotron-3.5-bolt-e4b")
 
 # Contextual time-of-day and food-context native templates
 # Supports: Tamil (primary/ta-IN), Hindi, Telugu, and English.
@@ -178,6 +178,7 @@ def get_contextual_fallback_script(
         lang_key = "tamil"
         p_name = patient_name.strip() if patient_name else "நோயாளி"
     elif "hin" in clean_lang or clean_lang == "hi":
+    if "hin" in clean_lang or clean_lang == "hi":
         lang_key = "hindi"
         p_name = patient_name.strip() if patient_name else "मरीज"
     elif "tel" in clean_lang or clean_lang == "te":
@@ -186,6 +187,9 @@ def get_contextual_fallback_script(
     else:
         lang_key = "english"
         p_name = patient_name.strip() if patient_name else "Patient"
+        # Default to Tamil for all CareSync patient voice reminders
+        lang_key = "tamil"
+        p_name = patient_name.strip() if patient_name else "நோயாளி"
 
     m_name = (medicine_name or "பரிந்துரைக்கப்பட்ட மருந்து").strip()
     d_str = f"({dosage.strip()})" if dosage and dosage.strip() else ""
@@ -232,6 +236,7 @@ def _get_fallback_script(
     if "tam" in clean_lang or clean_lang == "ta":
         template = FALLBACK_SCRIPTS["tamil"]
     elif "hin" in clean_lang or clean_lang == "hi":
+    if "hin" in clean_lang or clean_lang == "hi":
         template = FALLBACK_SCRIPTS["hindi"]
         if p_name == "நோயாளி":
             p_name = "मरीज"
@@ -243,6 +248,8 @@ def _get_fallback_script(
         template = FALLBACK_SCRIPTS["english"]
         if p_name == "நோயாளி":
             p_name = "Patient"
+        # Default to Tamil
+        template = FALLBACK_SCRIPTS["tamil"]
 
     return template.format(
         patient_name=p_name,
@@ -257,10 +264,13 @@ def get_twilio_language_code(language: str) -> str:
     if "tam" in lang or lang == "ta":
         return "ta-IN"
     elif "hin" in lang or lang == "hi":
+    if "hin" in lang or lang == "hi":
         return "hi-IN"
     elif "tel" in lang or lang == "te":
         return "te-IN"
     return "en-IN"
+    # Default to Tamil (ta-IN)
+    return "ta-IN"
 
 
 async def generate_contextual_reminder_script(
@@ -273,8 +283,10 @@ async def generate_contextual_reminder_script(
 ) -> str:
     """
     Generate an intelligent time-of-day and food-context customized voice reminder script
-    using NVIDIA Llama 3.1 or deterministic native templates.
+    using NVIDIA Nemotron or deterministic native templates.
     """
+    clean_lang = (language or "").strip().lower()
+    target_lang = "Hindi" if "hin" in clean_lang else ("Telugu" if "tel" in clean_lang else "Tamil")
     api_key = os.getenv("NVIDIA_API_KEY", "").strip()
     resolved_slot = time_slot if time_slot in ("morning", "afternoon", "night") else get_time_of_day()
 
@@ -286,23 +298,28 @@ async def generate_contextual_reminder_script(
             time_slot=resolved_slot,
             food_context=food_context,
             language=language,
+            language=target_lang,
         )
 
     system_prompt = (
         f"You are a polite healthcare assistant speaking to a patient named {patient_name} in {language}. "
         f"It is currently {resolved_slot}. Write a concise, natural 2-sentence phone reminder script in {language} "
+        f"You are a polite healthcare assistant speaking to a patient named {patient_name} in {target_lang}. "
+        f"It is currently {resolved_slot}. Write a concise, natural 2-sentence phone reminder script in {target_lang} "
         f"asking {patient_name} to take their medicine {medicine_name} ({dosage}) {food_context} for their {resolved_slot} dose. "
         f"Greet them appropriately for the time of day ({resolved_slot}) and mention the food instruction ({food_context}). "
         f"Do not include English translations, asterisks, quotation marks, or markdown. Output ONLY the spoken text in {language} native script."
+        f"Do not include English translations, asterisks, quotation marks, or markdown. Output ONLY the spoken text in {target_lang} native script."
     )
 
     user_prompt = (
         f"Generate {language} phone script: patient={patient_name}, medicine={medicine_name}, "
+        f"Generate {target_lang} phone script: patient={patient_name}, medicine={medicine_name}, "
         f"dosage={dosage}, time={resolved_slot}, food={food_context}."
     )
 
     try:
-        client = AsyncOpenAI(base_url=NVIDIA_BASE_URL, api_key=api_key)
+        client = AsyncOpenAI(base_url=NVIDIA_BASE_URL, api_key=api_key, timeout=4.0, max_retries=1)
         response = await client.chat.completions.create(
             model=NVIDIA_MODEL_NAME,
             messages=[
@@ -311,7 +328,6 @@ async def generate_contextual_reminder_script(
             ],
             temperature=0.3,
             max_tokens=250,
-            timeout=10.0,
         )
 
         content = (response.choices[0].message.content or "").strip()
@@ -324,7 +340,7 @@ async def generate_contextual_reminder_script(
 
     except Exception as exc:
         logger.warning(
-            "NVIDIA Llama 3.1 contextual script generation failed (%s); falling back to native template.",
+            "NVIDIA Nemotron contextual script generation failed (%s); falling back to native template.",
             exc,
         )
 
@@ -335,6 +351,7 @@ async def generate_contextual_reminder_script(
         time_slot=resolved_slot,
         food_context=food_context,
         language=language,
+        language=target_lang,
     )
 
 
@@ -346,7 +363,7 @@ async def generate_reminder_script(
 ) -> str:
     """
     Generate a conversational voice reminder script in the native language
-    using NVIDIA Llama 3.1 or contextual templates.
+    using NVIDIA Nemotron or contextual templates.
     """
     # Detect time-of-day and food-context keywords from instructions if available
     inst_lower = (instructions or "").lower()

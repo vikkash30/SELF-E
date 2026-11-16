@@ -3,7 +3,9 @@ import { Link } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import {
   collection,
+  doc,
   onSnapshot,
+  setDoc,
 } from 'firebase/firestore';
 import {
   AlertCircle,
@@ -12,6 +14,7 @@ import {
   Clock,
   Globe,
   Loader2,
+  MessageSquare,
   Phone,
   PhoneCall,
   Pill,
@@ -20,58 +23,11 @@ import {
   Sparkles,
   User,
   Volume2,
+  X,
 } from 'lucide-react';
 import { firestoreDb, isFirebaseConfigured } from './firebase.js';
 import { API_BASE_URL } from './syncManager.js';
 import AnimatedCard from './components/AnimatedCard.jsx';
-
-const DEFAULT_DEMO_VISITS = [
-  {
-    visit_id: 'demo-v-001',
-    patient_name: 'Muthusamy K.',
-    phoneNumber: '+919994577702',
-    age: 54,
-    gender: 'Male',
-    prescription: {
-      medicine_name: 'Tab. Paracetamol 650mg',
-      dosage: '1 Tablet',
-      timing: 'Morning & Night (8:00 AM, 8:00 PM)',
-      food_context: 'After Food',
-      duration: '5 Days',
-    },
-    location: 'Kinathukadavu Block, Coimbatore',
-  },
-  {
-    visit_id: 'demo-v-002',
-    patient_name: 'Lakshmi Narayanan',
-    phoneNumber: '+919842100012',
-    age: 48,
-    gender: 'Female',
-    prescription: {
-      medicine_name: 'Cap. Amoxicillin 250mg',
-      dosage: '1 Capsule',
-      timing: 'Three Times a Day',
-      food_context: 'After Meals',
-      duration: '7 Days',
-    },
-    location: 'Madukkarai PHC, Coimbatore',
-  },
-  {
-    visit_id: 'demo-v-003',
-    patient_name: 'Arumugam P.',
-    phoneNumber: '+919443211100',
-    age: 62,
-    gender: 'Male',
-    prescription: {
-      medicine_name: 'Tab. Metformin 500mg',
-      dosage: '1 Tablet',
-      timing: 'Morning with Breakfast',
-      food_context: 'With Food',
-      duration: '30 Days',
-    },
-    location: 'Sundarapuram, Coimbatore',
-  },
-];
 
 const LANGUAGE_OPTIONS = [
   { code: 'Tamil', label: 'தமிழ் (Tamil)', tag: 'ta-IN' },
@@ -109,6 +65,9 @@ export default function ReminderDashboard() {
   );
   const [callHistory, setCallHistory] = useState([]);
   const [phoneOverrides, setPhoneOverrides] = useState({});
+  const [smsLoadingMap, setSmsLoadingMap] = useState({});
+  const [toast, setToast] = useState(null);
+  const [isRefreshing, setIsRefreshing] = useState(false);
 
   function handleLanguageChange(nextLangName) {
     setSelectedLanguage(nextLangName);
@@ -118,59 +77,141 @@ export default function ReminderDashboard() {
     i18n.changeLanguage(code);
   }
 
-  // 1. Data Fetch: Real-time Firebase listener for visits with prescription & phoneNumber
+  // Phase 2: Read Live Firebase Data (Zero Mock Arrays)
+  useEffect(() => {
+    let unsubscribe = () => {};
+  function normalizePatient(docId, data) {
+    if (!data) return null;
+    const phone = data.phoneNumber || data.phone_number || '';
+    const pName = data.patient_name || data.patientName || data.name || 'Patient';
+    const prescList = Array.isArray(data.prescriptions) && data.prescriptions.length > 0
+      ? data.prescriptions
+      : data.prescription
+        ? [data.prescription]
+        : [];
+    const rawLang = (data.language || '').toLowerCase();
+    const lang = rawLang.includes('hin') ? 'Hindi' : (rawLang.includes('tel') ? 'Telugu' : (rawLang.includes('eng') ? 'English' : 'Tamil'));
+
+    return {
+      visit_id: docId || data.visit_id || data.id,
+      ...data,
+      patient_name: pName,
+      patientName: pName,
+      phoneNumber: phone,
+      phone_number: phone,
+      language: lang,
+      prescriptions: prescList,
+      prescription: prescList[0] || null,
+    };
+  }
+
+  const fetchBackendVisits = async () => {
+    try {
+      const visitsRef = collection(firestoreDb, 'visits');
+      unsubscribe = onSnapshot(
+        visitsRef,
+        (snapshot) => {
+          const fetchedData = snapshot.docs.map((docSnap) => {
+            const data = docSnap.data();
+            const phone = data.phoneNumber || data.phone_number || '';
+            const pName = data.patient_name || data.patientName || data.name || 'Patient';
+            const prescList = Array.isArray(data.prescriptions) && data.prescriptions.length > 0
+              ? data.prescriptions
+              : data.prescription
+                ? [data.prescription]
+                : [];
+            return {
+              visit_id: docSnap.id,
+              ...data,
+              patient_name: pName,
+              patientName: pName,
+              phoneNumber: phone,
+              phone_number: phone,
+              prescriptions: prescList,
+              prescription: prescList[0] || null,
+            };
+      const res = await fetch(`${API_BASE_URL || 'http://localhost:8000'}/visits`, {
+        signal: AbortSignal.timeout ? AbortSignal.timeout(4000) : undefined,
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const visits = Array.isArray(data) ? data : (data.visits || []);
+        if (visits.length > 0) {
+          setPatients((prev) => {
+            const map = new Map();
+            prev.forEach((p) => {
+              if (p.visit_id) map.set(p.visit_id, p);
+            });
+            visits.forEach((raw) => {
+              const norm = normalizePatient(raw.visit_id || raw.id, raw);
+              if (norm && norm.visit_id) {
+                const existing = map.get(norm.visit_id) || {};
+                map.set(norm.visit_id, { ...existing, ...norm });
+              }
+            });
+            return Array.from(map.values());
+          });
+
+          console.log("Fetched Live Patients:", fetchedData);
+          setPatients(fetchedData);
+        },
+        (err) => {
+          console.error("Firestore visits listener error:", err);
+        }
+      );
+      }
+    } catch (err) {
+      console.error("Failed to attach Firestore listener:", err);
+      console.warn("Backend /visits fetch error:", err);
+    }
+  };
+
+    return () => unsubscribe();
+  // Phase 2: Live Dual-Sync (Backend /visits polling + Firestore onSnapshot)
   useEffect(() => {
     let unsubscribe = () => {};
 
-    if (isFirebaseConfigured) {
+    // 1. Initial backend fetch & polling every 3s
+    fetchBackendVisits();
+    const interval = setInterval(fetchBackendVisits, 3000);
+
+    // 2. Firestore listener if configured
+    if (isFirebaseConfigured && firestoreDb) {
       try {
         const visitsRef = collection(firestoreDb, 'visits');
         unsubscribe = onSnapshot(
           visitsRef,
           (snapshot) => {
-            const list = [];
-            snapshot.forEach((docSnap) => {
-              const data = docSnap.data();
-              const phone = data.phoneNumber || data.phone_number;
-              const prescList = Array.isArray(data.prescriptions) && data.prescriptions.length > 0
-                ? data.prescriptions
-                : data.prescription
-                  ? [data.prescription]
-                  : [];
-              // Must contain a prescription and a phone number
-              if (prescList.length > 0 && phone) {
-                list.push({
-                  visit_id: docSnap.id,
-                  ...data,
-                  phoneNumber: phone,
-                  prescriptions: prescList,
-                  prescription: prescList[0],
-                });
-              }
-            });
+            const fetchedData = snapshot.docs
+              .map((docSnap) => normalizePatient(docSnap.id, docSnap.data()))
+              .filter(Boolean);
 
-            if (list.length > 0) {
-              setPatients(list);
-            } else {
-              // Fallback to demo patients if no live records matched yet
-              setPatients(DEFAULT_DEMO_VISITS);
-            }
+            console.log("Fetched Live Patients from Firestore:", fetchedData);
+            setPatients((prev) => {
+              const map = new Map();
+              prev.forEach((p) => {
+                if (p.visit_id) map.set(p.visit_id, p);
+              });
+              fetchedData.forEach((norm) => {
+                const existing = map.get(norm.visit_id) || {};
+                map.set(norm.visit_id, { ...existing, ...norm });
+              });
+              return Array.from(map.values());
+            });
           },
           (err) => {
-            console.warn('Firestore visits listener error, fallback to demo store:', err);
-            setPatients(DEFAULT_DEMO_VISITS);
+            console.error("Firestore visits listener error:", err);
           }
         );
       } catch (err) {
-        console.warn('Failed to attach Firestore listener:', err);
-        setPatients(DEFAULT_DEMO_VISITS);
+        console.error("Failed to attach Firestore listener:", err);
       }
-    } else {
-      // Offline / demo placeholder mode
-      setPatients(DEFAULT_DEMO_VISITS);
     }
 
-    return () => unsubscribe();
+    return () => {
+      clearInterval(interval);
+      unsubscribe();
+    };
   }, []);
 
   function handlePhoneChange(visitId, newPhone) {
@@ -217,6 +258,7 @@ export default function ReminderDashboard() {
       medicine_name: medicine,
       instructions: instructions || 'Take as directed by doctor',
       language: selectedLanguage,
+      language: selectedLanguage || patient.language || 'Tamil',
     };
 
     console.log("Call Button Clicked", payload);
@@ -271,14 +313,185 @@ export default function ReminderDashboard() {
     }
   }
 
-  function handleAddTestPatient() {
-    const id = `test-${Date.now().toString().slice(-4)}`;
+  // Phase 4 & 5: Trigger Hackathon Time-Travel Medication SMS
+  async function handleTriggerMedsSMS(patient) {
+    const visitId = patient.visit_id;
+    const phoneToUse = (phoneOverrides[visitId] || patient.phoneNumber || patient.phone_number || '').trim();
+
+    if (!phoneToUse) {
+      console.error("Missing Phone Number for patient:", patient);
+      setActiveAlert({
+        type: 'error',
+        title: 'Missing Phone Number',
+        message: 'Patient has no phone number recorded. Cannot send medication SMS.',
+      });
+      setToast({
+        type: 'error',
+        title: 'Missing Phone Number',
+        message: 'Patient has no phone number recorded. Please update phone number first.',
+      });
+      return;
+    }
+
+    const patientName = patient.patient_name || patient.patientName || 'Patient';
+
+    const prescList = Array.isArray(patient.prescriptions) && patient.prescriptions.length > 0
+      ? patient.prescriptions
+      : patient.prescription
+        ? [patient.prescription]
+        : [];
+    const medName = prescList[0]?.medicine_name || prescList[0]?.medicineName || patient.prescription?.medicine_name || 'Prescribed Medication';
+
+    setSmsLoadingMap((prev) => ({ ...prev, [`${visitId}-meds`]: true }));
+
+    try {
+      const res = await fetch(`${API_BASE_URL || 'http://localhost:8000'}/admin/trigger-sms/meds`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          phone_number: phoneToUse,
+          medicine_name: medName,
+          time_of_day: 'Morning',
+          language: selectedLanguage,
+          language: selectedLanguage || patient.language || 'Tamil',
+          patient_name: patientName,
+        }),
+      });
+
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok) {
+        throw new Error(data?.detail || data?.message || `HTTP ${res.status}: Meds SMS failed`);
+      }
+
+      const alertItem = {
+        type: 'success',
+        title: 'Twilio Morning Meds SMS Dispatched!',
+        callSid: data.sid,
+        to: data.to,
+        language: data.language,
+        script: data.body,
+        timestamp: new Date().toLocaleTimeString(),
+      };
+      setActiveAlert(alertItem);
+      setCallHistory((prev) => [alertItem, ...prev]);
+      setToast({
+        type: 'success',
+        title: 'Morning Meds SMS Sent',
+        message: `Dispatched to ${data.to}: "${data.body}"`,
+      });
+      setTimeout(() => setToast(null), 5000);
+    } catch (err) {
+      console.error('Trigger Meds SMS error:', err);
+      setActiveAlert({
+        type: 'error',
+        title: 'Meds SMS Failed',
+        message: err.message || 'Failed to dispatch medication SMS',
+      });
+      setToast({
+        type: 'error',
+        title: 'SMS Failed',
+        message: err.message,
+      });
+      setTimeout(() => setToast(null), 5000);
+    } finally {
+      setSmsLoadingMap((prev) => ({ ...prev, [`${visitId}-meds`]: false }));
+    }
+  }
+
+  // Phase 4 & 5: Trigger Hackathon Time-Travel Appointment SMS
+  async function handleTriggerApptSMS(patient, alertType) {
+    const visitId = patient.visit_id;
+    const phoneToUse = (phoneOverrides[visitId] || patient.phoneNumber || patient.phone_number || '').trim();
+
+    if (!phoneToUse) {
+      console.error("Missing Phone Number for patient:", patient);
+      setActiveAlert({
+        type: 'error',
+        title: 'Missing Phone Number',
+        message: 'Patient has no phone number recorded. Cannot send appointment SMS.',
+      });
+      setToast({
+        type: 'error',
+        title: 'Missing Phone Number',
+        message: 'Patient has no phone number recorded. Please update phone number first.',
+      });
+      return;
+    }
+
+    const patientName = patient.patient_name || patient.patientName || 'Patient';
+    const apptTime = patient.next_appointment || patient.nextAppointment || 'Tomorrow at 10:00 AM';
+
+    setSmsLoadingMap((prev) => ({ ...prev, [`${visitId}-${alertType}`]: true }));
+
+    try {
+      const res = await fetch(`${API_BASE_URL || 'http://localhost:8000'}/admin/trigger-sms/appointment`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          phone_number: phoneToUse,
+          appointment_time: apptTime,
+          alert_type: alertType,
+          language: selectedLanguage,
+          language: selectedLanguage || patient.language || 'Tamil',
+          patient_name: patientName,
+        }),
+      });
+
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok) {
+        throw new Error(data?.detail || data?.message || `HTTP ${res.status}: Appt SMS failed`);
+      }
+
+      const alertLabel = alertType === '1_day_before' ? '1 Day Before' : '10 Min Before';
+      const alertItem = {
+        type: 'success',
+        title: `Twilio Appointment (${alertLabel}) SMS Dispatched!`,
+        callSid: data.sid,
+        to: data.to,
+        language: data.language,
+        script: data.body,
+        timestamp: new Date().toLocaleTimeString(),
+      };
+      setActiveAlert(alertItem);
+      setCallHistory((prev) => [alertItem, ...prev]);
+      setToast({
+        type: 'success',
+        title: `Appt SMS (${alertLabel}) Sent`,
+        message: `Dispatched to ${data.to}: "${data.body}"`,
+      });
+      setTimeout(() => setToast(null), 5000);
+    } catch (err) {
+      console.error('Trigger Appt SMS error:', err);
+      setActiveAlert({
+        type: 'error',
+        title: 'Appt SMS Failed',
+        message: err.message || 'Failed to dispatch appointment SMS',
+      });
+      setToast({
+        type: 'error',
+        title: 'SMS Failed',
+        message: err.message,
+      });
+      setTimeout(() => setToast(null), 5000);
+    } finally {
+      setSmsLoadingMap((prev) => ({ ...prev, [`${visitId}-${alertType}`]: false }));
+    }
+  }
+
+  async function handleAddTestPatient() {
+    const id = `visit-${Date.now().toString().slice(-6)}`;
     const newPatient = {
       visit_id: id,
-      patient_name: `Demo Patient #${patients.length + 1}`,
-      phoneNumber: '+919994577702',
+      patient_name: `Patient #${patients.length + 1}`,
+      patientName: `Patient #${patients.length + 1}`,
+      phoneNumber: '',
+      phone_number: '',
       age: 45,
       gender: 'Male',
+      language: 'Tamil',
+      symptoms: 'Routine medication follow-up',
       prescription: {
         medicine_name: 'Tab. Paracetamol 650mg',
         dosage: '1 Tablet',
@@ -286,9 +499,33 @@ export default function ReminderDashboard() {
         food_context: 'After Food',
         duration: '3 Days',
       },
-      location: 'Field Kiosk Station 1',
+      prescriptions: [{
+        medicine_name: 'Tab. Paracetamol 650mg',
+        dosage: '1 Tablet',
+        timing: ['Morning', 'Night'],
+        food_context: 'After Food',
+        duration: '3 Days',
+      }],
+      status: 'triaged',
+      created_at: new Date().toISOString(),
     };
+
+    try {
+      await setDoc(doc(firestoreDb, 'visits', id), newPatient, { merge: true });
+    } catch {
+      setPatients((prev) => [newPatient, ...prev]);
     setPatients((prev) => [newPatient, ...prev]);
+
+    if (isFirebaseConfigured && firestoreDb) {
+      try {
+        await Promise.race([
+          setDoc(doc(firestoreDb, 'visits', id), newPatient, { merge: true }),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 1500))
+        ]);
+      } catch (e) {
+        console.warn("Firestore setDoc bypassed/timed out:", e);
+      }
+    }
   }
 
   return (
@@ -313,11 +550,11 @@ export default function ReminderDashboard() {
                   {t('Voice Reminder Trigger Workstation')}
                 </h1>
                 <span className="rounded-full bg-blue-100 px-2.5 py-0.5 text-xs font-bold text-blue-700">
-                  Twilio + Llama 3.1
+                  Twilio + NVIDIA Nemotron
                 </span>
               </div>
               <p className="text-xs text-slate-500">
-                Automated Outbound Multilingual Phone Calls &bull; Route: <code className="text-slate-700 font-mono">/admin/reminders</code>
+                Automated Outbound Multilingual Phone Calls &bull; Route: <code className="text-slate-700 font-mono">/reminders</code>
               </p>
             </div>
           </div>
@@ -343,8 +580,22 @@ export default function ReminderDashboard() {
 
             <button
               type="button"
+              onClick={() => {
+                setIsRefreshing(true);
+                fetchBackendVisits().finally(() => setIsRefreshing(false));
+              }}
+              className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3.5 py-2 text-xs font-bold text-slate-700 hover:bg-slate-50 transition shadow-xs cursor-pointer"
+              title="Poll live patients from backend API"
+            >
+              <RefreshCw className={`h-3.5 w-3.5 text-blue-600 ${isRefreshing ? 'animate-spin' : ''}`} />
+              {t('Sync Live Data')}
+            </button>
+
+            <button
+              type="button"
               onClick={handleAddTestPatient}
               className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3.5 py-2 text-xs font-bold text-slate-700 hover:bg-slate-50 transition shadow-xs"
+              className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3.5 py-2 text-xs font-bold text-slate-700 hover:bg-slate-50 transition shadow-xs cursor-pointer"
             >
               <PlusCircle className="h-3.5 w-3.5 text-emerald-600" />
               {t('Add Test Patient')}
@@ -401,7 +652,7 @@ export default function ReminderDashboard() {
                   <div className="rounded-xl border border-current/15 bg-white/80 p-3">
                     <p className="mb-1 flex items-center gap-1.5 text-[11px] font-black uppercase tracking-wider text-slate-500">
                       <Volume2 className="h-3.5 w-3.5 text-[#2563EB]" />
-                      NVIDIA Llama 3.1 Generated Spoken Script ({activeAlert.language}):
+                      NVIDIA Nemotron Generated Spoken Script ({activeAlert.language}):
                     </p>
                     <p className="text-sm font-semibold leading-relaxed text-[#142D4E]">
                       "{activeAlert.script}"
@@ -457,10 +708,10 @@ export default function ReminderDashboard() {
                 return (
                   <div
                     key={visitId}
-                    className="flex flex-col gap-4 py-4 sm:flex-row sm:items-center sm:justify-between transition hover:bg-slate-50/50 rounded-xl px-2"
+                    className="flex flex-col gap-4 py-4 xl:flex-row xl:items-center xl:justify-between transition hover:bg-slate-50/50 rounded-xl px-2 border-b border-slate-100 last:border-b-0"
                   >
                     {/* Patient Info & Contact */}
-                    <div className="space-y-1 sm:max-w-[32%]">
+                    <div className="space-y-1 xl:max-w-[26%]">
                       <div className="flex items-center gap-2">
                         <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-blue-50 text-[#2563EB]">
                           <User className="h-4 w-4" />
@@ -488,32 +739,40 @@ export default function ReminderDashboard() {
                     </div>
 
                     {/* Prescribed Medicine & Timing */}
-                    <div className="space-y-1 sm:max-w-[42%]">
+                    <div className="space-y-1 xl:max-w-[32%]">
                       <div className="flex items-center gap-2">
                         <span className="rounded-md bg-blue-50 px-2 py-0.5 text-xs font-black text-[#2563EB]">
                           {presc.medicine_name || t('Prescription Details')}
                         </span>
                       </div>
                       <p className="text-xs font-bold text-slate-700">
-                        {presc.dosage || '1 unit'} &bull; {presc.timing || 'As directed'}
+                        {presc.dosage || '1 unit'} &bull; {Array.isArray(presc.timing) ? presc.timing.join(', ') : (presc.timing || 'As directed')}
                       </p>
                       <p className="text-[11px] text-slate-500 font-medium">
                         {t('Food Context')}: {presc.food_context || t('After Food')} &bull; {t('Duration')}: {presc.duration || '3 days'}
                       </p>
+                      {(patient.next_appointment || patient.nextAppointment) && (
+                        <p className="text-[11px] font-bold text-indigo-700 bg-indigo-50/80 px-2 py-0.5 rounded-md inline-flex items-center gap-1 border border-indigo-200/60 mt-1">
+                          <Clock className="h-3 w-3 text-indigo-600" />
+                          <span>Appt: {patient.next_appointment || patient.nextAppointment}</span>
+                        </p>
+                      )}
                     </div>
 
-                    {/* Action Button: Trigger Voice Call */}
-                    <div className="flex items-center sm:justify-end">
+                    {/* Action Controls: Live Voice Call + SMS Overrides Column */}
+                    <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3 xl:justify-end">
+                      {/* Voice Call Button */}
                       <button
                         type="button"
                         disabled={isLoading}
                         onClick={() => handleTriggerCall(patient)}
-                        className="inline-flex min-h-11 items-center justify-center gap-2 rounded-xl bg-blue-700 px-5 py-2.5 text-xs font-bold text-white shadow-sm hover:bg-blue-800 active:scale-95 transition disabled:opacity-60 disabled:cursor-not-allowed cursor-pointer"
+                        className="inline-flex min-h-10 items-center justify-center gap-2 rounded-xl bg-blue-700 hover:bg-blue-800 px-4 py-2 text-xs font-bold text-white shadow-xs active:scale-95 transition disabled:opacity-60 disabled:cursor-not-allowed cursor-pointer"
+                        title="Initiate automated outbound Twilio voice reminder"
                       >
                         {isLoading ? (
                           <>
                             <Loader2 className="h-4 w-4 animate-spin" />
-                            <span>{t('Calling via Twilio...')}</span>
+                            <span>{t('Calling...')}</span>
                           </>
                         ) : (
                           <>
@@ -522,6 +781,63 @@ export default function ReminderDashboard() {
                           </>
                         )}
                       </button>
+
+                      {/* Phase 5: SMS Overrides Column */}
+                      <div className="flex flex-col gap-1.5 border-t sm:border-t-0 sm:border-l border-slate-200/80 pt-2 sm:pt-0 sm:pl-3">
+                        <span className="text-[10px] font-black uppercase tracking-wider text-slate-500 flex items-center gap-1">
+                          <MessageSquare className="h-3 w-3 text-blue-600" />
+                          SMS Overrides (Live Demo)
+                        </span>
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          {/* 1. Test Morning Meds SMS */}
+                          <button
+                            type="button"
+                            disabled={Boolean(smsLoadingMap[`${visitId}-meds`])}
+                            onClick={() => handleTriggerMedsSMS(patient)}
+                            className="inline-flex items-center gap-1 rounded-lg border border-blue-200 bg-blue-50/90 hover:bg-blue-100 px-2.5 py-1.5 text-[11px] font-bold text-blue-800 transition active:scale-95 disabled:opacity-50 cursor-pointer shadow-2xs"
+                            title="Trigger instant morning medication reminder SMS"
+                          >
+                            {smsLoadingMap[`${visitId}-meds`] ? (
+                              <Loader2 className="h-3 w-3 animate-spin text-blue-700" />
+                            ) : (
+                              <span>📱</span>
+                            )}
+                            <span>Test Morning Meds SMS</span>
+                          </button>
+
+                          {/* 2. Test Appt (1 Day) */}
+                          <button
+                            type="button"
+                            disabled={Boolean(smsLoadingMap[`${visitId}-1_day_before`])}
+                            onClick={() => handleTriggerApptSMS(patient, '1_day_before')}
+                            className="inline-flex items-center gap-1 rounded-lg border border-emerald-200 bg-emerald-50/90 hover:bg-emerald-100 px-2.5 py-1.5 text-[11px] font-bold text-emerald-800 transition active:scale-95 disabled:opacity-50 cursor-pointer shadow-2xs"
+                            title="Trigger 1-day before appointment follow-up SMS"
+                          >
+                            {smsLoadingMap[`${visitId}-1_day_before`] ? (
+                              <Loader2 className="h-3 w-3 animate-spin text-emerald-700" />
+                            ) : (
+                              <span>📅</span>
+                            )}
+                            <span>Test Appt (1 Day)</span>
+                          </button>
+
+                          {/* 3. Test Appt (10 Min) */}
+                          <button
+                            type="button"
+                            disabled={Boolean(smsLoadingMap[`${visitId}-10_mins_before`])}
+                            onClick={() => handleTriggerApptSMS(patient, '10_mins_before')}
+                            className="inline-flex items-center gap-1 rounded-lg border border-purple-200 bg-purple-50/90 hover:bg-purple-100 px-2.5 py-1.5 text-[11px] font-bold text-purple-800 transition active:scale-95 disabled:opacity-50 cursor-pointer shadow-2xs"
+                            title="Trigger 10-minutes before appointment follow-up SMS"
+                          >
+                            {smsLoadingMap[`${visitId}-10_mins_before`] ? (
+                              <Loader2 className="h-3 w-3 animate-spin text-purple-700" />
+                            ) : (
+                              <span>⏳</span>
+                            )}
+                            <span>Test Appt (10 Min)</span>
+                          </button>
+                        </div>
+                      </div>
                     </div>
                   </div>
                 );
@@ -544,7 +860,7 @@ export default function ReminderDashboard() {
                     <th className="py-2 px-3">Time</th>
                     <th className="py-2 px-3">Recipient</th>
                     <th className="py-2 px-3">Language</th>
-                    <th className="py-2 px-3">Twilio Call SID</th>
+                    <th className="py-2 px-3">Twilio SID (Voice / SMS)</th>
                     <th className="py-2 px-3">Generated Script</th>
                   </tr>
                 </thead>
@@ -572,6 +888,34 @@ export default function ReminderDashboard() {
               </table>
             </div>
           </AnimatedCard>
+        )}
+
+        {/* Phase 5: Floating SMS & Call Feedback Toast */}
+        {toast && (
+          <div className="fixed bottom-6 right-6 z-50 flex items-center gap-3 rounded-2xl border border-slate-200 bg-white/95 backdrop-blur-md p-4 shadow-xl text-xs font-bold transition-all">
+            <span
+              className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-xl text-white ${
+                toast.type === 'error' ? 'bg-rose-600' : 'bg-emerald-600'
+              }`}
+            >
+              {toast.type === 'error' ? (
+                <AlertCircle className="h-4 w-4" />
+              ) : (
+                <CheckCircle2 className="h-4 w-4" />
+              )}
+            </span>
+            <div className="max-w-xs space-y-0.5">
+              <p className="font-black text-slate-900">{toast.title || 'Notification'}</p>
+              <p className="text-slate-600 text-[11px] line-clamp-2">{toast.message}</p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setToast(null)}
+              className="text-slate-400 hover:text-slate-600 p-1 rounded-lg cursor-pointer transition"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
         )}
       </main>
     </div>

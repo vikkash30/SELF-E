@@ -17,6 +17,9 @@ export default function PictorialPrescriptionCard({
   allPrescriptions = [],
   medicineIndex = 1,
   totalMedicines = 1,
+  isActiveAudio = false,
+  isAudioPlaying = false,
+  onPlayAudio,
 }) {
   const { t, i18n } = useTranslation();
   const [isPlaying, setIsPlaying] = useState(false);
@@ -69,6 +72,11 @@ export default function PictorialPrescriptionCard({
 
   // Audio Logic: Loop through the entire prescriptions array and speak all in one continuous utterance
   function playPrescriptionAudio() {
+    if (onPlayAudio) {
+      onPlayAudio();
+      return;
+    }
+
     if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
       alert('Browser speech synthesis is not supported in this browser.');
       return;
@@ -290,12 +298,19 @@ export default function PictorialPrescriptionCard({
             type="button"
             onClick={playPrescriptionAudio}
             className={`flex w-full items-center justify-center gap-3 rounded-2xl px-6 py-4 text-base font-black shadow-lg transition-all active:scale-[0.98] ${
-              isPlaying
-                ? 'bg-rose-600 text-white hover:bg-rose-700 ring-4 ring-rose-200 animate-pulse'
+              isActiveAudio
+                ? 'bg-amber-500 text-white hover:bg-amber-600 ring-4 ring-amber-300 animate-pulse'
+                : isAudioPlaying || isPlaying
+                ? 'bg-rose-600 text-white hover:bg-rose-700 ring-4 ring-rose-200'
                 : 'bg-gradient-to-r from-emerald-600 via-teal-600 to-teal-700 text-white hover:from-emerald-700 hover:to-teal-800 shadow-teal-700/25'
             }`}
           >
-            {isPlaying ? (
+            {isActiveAudio ? (
+              <>
+                <Volume2 className="h-6 w-6 animate-bounce" />
+                <span>🎙️ Reading Medicine #{medicineIndex} (Karaoke)...</span>
+              </>
+            ) : isAudioPlaying || isPlaying ? (
               <>
                 <VolumeX className="h-6 w-6" />
                 <span>{t('Stop Audio')}</span>

@@ -1,4 +1,4 @@
-"""Hybrid rule-based + NVIDIA NIM (Llama 3.1 8B) AI triage & scheme checklist engine."""
+"""Hybrid rule-based + NVIDIA NIM (Nemotron) AI triage & scheme checklist engine."""
 
 import json
 import logging
@@ -13,13 +13,13 @@ from database import get_all_health_schemes
 logger = logging.getLogger("caresync.triage")
 
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
-NVIDIA_MODEL_NAME = "meta/llama-3.1-8b-instruct"
+NVIDIA_MODEL_NAME = os.getenv("NVIDIA_MODEL_NAME", "nvidia/nemotron-3.5-bolt-e4b")
 
 COMPETITOR_BAN_PATTERN = re.compile(r"e[-\s]?sanjeevani|sanjeevani", re.IGNORECASE)
 
 _nvidia_api_key = os.environ.get("NVIDIA_API_KEY", "").strip()
 client: Optional[OpenAI] = (
-    OpenAI(base_url=NVIDIA_BASE_URL, api_key=_nvidia_api_key)
+    OpenAI(base_url=NVIDIA_BASE_URL, api_key=_nvidia_api_key, timeout=8.0, max_retries=1)
     if _nvidia_api_key
     else None
 )
@@ -34,7 +34,12 @@ CRITICAL RULE: You must NEVER recommend, mention, or include "eSanjeevani" or an
 - "Yellow": Consult Doctor (moderate symptoms, persistent fever, infection signs, dehydration, chest discomfort, breathing difficulty not yet critical, pediatric/elderly vulnerability, or unclear risk requiring PHC/CareSync telemedicine doctor review).
 - "Green": Self-care (mild, self-limiting symptoms such as mild cold, mild headache, minor fatigue, or mild acidity with normal vitals).
 
-2. Select 1 to 3 schemes strictly from the PROVIDED `health_schemes` list that fit the patient. For each scheme, set `requires_verification`:
+2. Provide strict clinical next steps / advice in a nested JSON object named "clinical_suggestions" containing exactly three keys:
+- "immediate_action": Clear first-aid or operator stabilization step (e.g., Elevate legs, provide oral rehydration salts, cold sponge for fever, rest).
+- "facility_routing": Specific facility tier/type recommendation (e.g., Refer to Primary Health Centre (PHC), Community Health Centre (CHC), Sub-centre, or CareSync telemedicine doctor consultation).
+- "required_tests": Diagnostic tests or checks needed (e.g., Check random blood sugar, CBC, repeat SpO2 and BP monitoring).
+
+3. Select 1 to 3 schemes strictly from the PROVIDED `health_schemes` list that fit the patient. For each scheme, set `requires_verification`:
 - `false` if the patient directly qualifies based on known data (e.g., Age, Gender, Symptoms, or universal generic drug access).
 - `true` if external document/BPL/income verification is needed (e.g., Ayushman Bharat BPL/SECC eligibility).
 You MUST copy scheme names verbatim from the provided list and NEVER invent schemes not on the list.
@@ -45,6 +50,11 @@ Return ONLY valid JSON matching this exact schema:
   "classification": "Consult Doctor" | "Self-care",
   "reason": "1-2 short sentences explaining the triage decision in plain language.",
   "recommended_action": "Clear, practical next step for the ration-shop operator and patient.",
+  "clinical_suggestions": {
+    "immediate_action": "Elevate legs, provide oral rehydration...",
+    "facility_routing": "Refer to Primary Health Centre (PHC)...",
+    "required_tests": "Check random blood sugar, CBC..."
+  },
   "red_flags_to_watch": ["symptom 1", "symptom 2"],
   "eligible_schemes": [
     {
@@ -116,7 +126,7 @@ def _get_nvidia_client() -> Optional[OpenAI]:
         logger.warning("NVIDIA_API_KEY does not start with 'nvapi-'; skipping NVIDIA NIM call.")
         return None
     if client is None or getattr(client, "api_key", None) != api_key:
-        client = OpenAI(base_url=NVIDIA_BASE_URL, api_key=api_key)
+        client = OpenAI(base_url=NVIDIA_BASE_URL, api_key=api_key, timeout=8.0, max_retries=1)
     return client
 
 
@@ -312,6 +322,11 @@ def _evaluate_hard_rules(
             "Immediate referral to nearest Community Health Centre (CHC) or District Hospital. "
             "Arrange 108 ambulance transport and stabilize patient."
         ),
+        "clinical_suggestions": {
+            "immediate_action": "Elevate legs, provide high-flow oxygen if available, clear airway, and keep patient warm.",
+            "facility_routing": "Emergency referral to nearest Community Health Centre (CHC) or District Hospital via 108 ambulance.",
+            "required_tests": "Continuous SpO2 monitoring, 12-lead ECG, blood pressure series, arterial blood gas.",
+        },
         "red_flags_to_watch": reasons,
         "eligible_schemes": _match_schemes_heuristic(
             scheme_names, symptoms_text, age, gender, "Red"
@@ -356,6 +371,38 @@ def _parse_llm_json(
         severity,
     )
 
+    # Strictly extract and validate clinical_suggestions (with immediate_action, facility_routing, required_tests)
+    raw_suggestions = parsed.get("clinical_suggestions")
+    if not isinstance(raw_suggestions, dict):
+        alt = parsed.get("advice") or parsed.get("next_steps")
+        raw_suggestions = alt if isinstance(alt, dict) else {}
+
+    default_cs_map = {
+        "Yellow": {
+            "immediate_action": "Rest patient in well-ventilated area, provide oral rehydration salts (ORS), and avoid strenuous activity.",
+            "facility_routing": "Refer to Primary Health Centre (PHC) or schedule CareSync telemedicine doctor consultation.",
+            "required_tests": "Check random blood sugar (RBS), complete blood count (CBC), and repeat vital signs.",
+        },
+        "Green": {
+            "immediate_action": "Advise adequate oral hydration, light home-cooked meals, and rest.",
+            "facility_routing": "Self-care with local sub-centre / Ayushman Arogya Mandir follow-up if symptoms persist beyond 48 hours.",
+            "required_tests": "Routine vitals check if symptoms do not improve.",
+        },
+    }
+    fallback_cs = default_cs_map.get(severity, default_cs_map["Yellow"])
+
+    clinical_suggestions = {
+        "immediate_action": _sanitize_competitor_mentions(
+            str(raw_suggestions.get("immediate_action") or fallback_cs["immediate_action"]).strip()
+        ),
+        "facility_routing": _sanitize_competitor_mentions(
+            str(raw_suggestions.get("facility_routing") or fallback_cs["facility_routing"]).strip()
+        ),
+        "required_tests": _sanitize_competitor_mentions(
+            str(raw_suggestions.get("required_tests") or fallback_cs["required_tests"]).strip()
+        ),
+    }
+
     return {
         "severity": severity,
         "classification": _sanitize_competitor_mentions(
@@ -374,6 +421,7 @@ def _parse_llm_json(
                 )
             )
         ),
+        "clinical_suggestions": clinical_suggestions,
         "red_flags_to_watch": [_sanitize_competitor_mentions(str(item)) for item in red_flags],
         "eligible_schemes": eligible_schemes,
         "source": f"nvidia-nim/{NVIDIA_MODEL_NAME}",
@@ -397,6 +445,11 @@ def _fallback_symptom_triage(
             "classification": "Consult Doctor",
             "reason": f"Stable vitals, but complaints include moderate-risk indicators ({', '.join(matched[:3])}).",
             "recommended_action": "Schedule a PHC doctor or CareSync telemedicine consultation today.",
+            "clinical_suggestions": {
+                "immediate_action": "Elevate legs if dizzy, provide oral rehydration salts (ORS), and avoid heavy physical exertion.",
+                "facility_routing": "Refer to Primary Health Centre (PHC) or schedule CareSync telemedicine doctor consultation.",
+                "required_tests": "Check random blood sugar (RBS), complete blood count (CBC), and repeat vital signs.",
+            },
             "red_flags_to_watch": ["Worsening breathlessness", "SpO2 dropping below 92%", "Persistent high fever"],
             "eligible_schemes": _match_schemes_heuristic(
                 scheme_names, symptoms_text, age, gender, "Yellow"
@@ -409,6 +462,11 @@ def _fallback_symptom_triage(
         "classification": "Self-care",
         "reason": "Vitals are within safe limits and no moderate-risk symptom flags were detected.",
         "recommended_action": "Advise rest, hydration/ORS, and follow up at the ration shop kiosk if symptoms persist beyond 48 hours.",
+        "clinical_suggestions": {
+            "immediate_action": "Advise adequate oral hydration, nutritious diet, warm fluids, and rest at home.",
+            "facility_routing": "Self-care with local sub-centre / Ayushman Arogya Mandir follow-up if symptoms persist beyond 48 hours.",
+            "required_tests": "Routine vitals check if symptoms do not improve.",
+        },
         "red_flags_to_watch": ["Fever rising above 103°F", "SpO2 below 92%", "New chest pain or confusion"],
         "eligible_schemes": _match_schemes_heuristic(
             scheme_names, symptoms_text, age, gender, "Green"
@@ -428,7 +486,7 @@ def calculate_triage(
 
     1. Fetches scheme names from Firestore `health_schemes`, stripping any banned competitor names.
     2. Evaluates hard-coded vital-sign red flags first (SpO2 < 92, Temperature > 103°F, etc.).
-    3. If vitals are stable, calls NVIDIA NIM (meta/llama-3.1-8b-instruct) via OpenAI SDK.
+    3. If vitals are stable, calls NVIDIA NIM (Nemotron) via OpenAI SDK.
     """
     vitals = vitals or {}
     symptoms_clean = (symptoms_text or "").strip()

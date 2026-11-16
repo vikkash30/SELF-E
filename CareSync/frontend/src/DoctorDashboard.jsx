@@ -68,6 +68,7 @@ export default function DoctorDashboard() {
   const [prescriptions, setPrescriptions] = useState([
     { medicineName: '', dosage: '1 Tablet', timing: ['Morning', 'Night'], foodContext: 'After Food', duration: '5 Days' },
   ]);
+  const [nextAppointment, setNextAppointment] = useState('');
   const [isSendingPrescription, setIsSendingPrescription] = useState(false);
   const [prescriptionNotice, setPrescriptionNotice] = useState(null);
 
@@ -190,6 +191,7 @@ export default function DoctorDashboard() {
     const pollTimer = !isFirebaseConfigured
       ? setInterval(fetchBackendEscalated, 2000)
       : null;
+    const pollTimer = setInterval(fetchBackendEscalated, 3000);
 
     let channel;
     if (typeof BroadcastChannel !== 'undefined') {
@@ -227,6 +229,89 @@ export default function DoctorDashboard() {
     setPrescriptionNotice(null);
   }
 
+  // Phase 3: Listen for Teach-Back confirmation from Operator for the active case
+  useEffect(() => {
+    if (!selectedCase?.visit_id) return;
+    const activeVisitId = String(selectedCase.visit_id);
+
+    let unsubscribe = () => {};
+    if (isFirebaseConfigured) {
+      const visitDocRef = doc(firestoreDb, 'visits', activeVisitId);
+      unsubscribe = onSnapshot(
+        visitDocRef,
+        (snap) => {
+          if (snap.exists()) {
+            const data = snap.data();
+            const list = data.prescriptions || (data.prescription ? [data.prescription] : []);
+            if (Array.isArray(list) && list.length > 0) {
+              setPrescriptions((prev) =>
+                prev.map((med, idx) => {
+                  const match = list[idx] || list.find((m) => (m.medicineName || m.medicine_name) === med.medicineName);
+                  if (match && match.understood) {
+                    return { ...med, understood: true };
+                  }
+                  return med;
+                })
+              );
+            }
+          }
+        },
+        (err) => console.warn('Firestore active visit listener error in DoctorDashboard:', err)
+      );
+    }
+
+    let bc;
+    if (typeof BroadcastChannel !== 'undefined') {
+      bc = new BroadcastChannel('caresync-prescription');
+      bc.onmessage = (event) => {
+        if (
+          event.data?.type === 'TEACH_BACK_CONFIRMED' &&
+          (String(event.data.visit_id) === activeVisitId || !event.data.visit_id)
+        ) {
+          const list = event.data.prescriptions || [];
+          setPrescriptions((prev) =>
+            prev.map((med, idx) => {
+              const match = list[idx] || list.find((m) => (m.medicineName || m.medicine_name) === med.medicineName);
+              if (match && match.understood) {
+                return { ...med, understood: true };
+              }
+              return med;
+            })
+          );
+        }
+      };
+    }
+
+    const onStorage = (e) => {
+      if (e.key === 'caresync_latest_prescription' && e.newValue) {
+        try {
+          const payload = JSON.parse(e.newValue);
+          if (String(payload.visit_id) === activeVisitId || !payload.visit_id) {
+            const list = payload.prescriptions || [];
+            setPrescriptions((prev) =>
+              prev.map((med, idx) => {
+                const match = list[idx] || list.find((m) => (m.medicineName || m.medicine_name) === med.medicineName);
+                if (match && match.understood) {
+                  return { ...med, understood: true };
+                }
+                return med;
+              })
+            );
+          }
+        } catch {
+          // Ignore
+        }
+      }
+    };
+    window.addEventListener('storage', onStorage);
+
+    return () => {
+      unsubscribe();
+      if (bc) bc.close();
+      window.removeEventListener('storage', onStorage);
+    };
+  }, [selectedCase?.visit_id]);
+
   async function handleSendPrescription(e) {
     if (e) e.preventDefault();
     if (!selectedCase) return;
@@ -252,6 +337,22 @@ export default function DoctorDashboard() {
     setPrescriptionNotice(null);
 
     const visitId = selectedCase.visit_id;
+    const patientPhone = selectedCase.phoneNumber || selectedCase.phone_number || selectedCase.patient_phone || '';
+    const patientName = selectedCase.patient_name || selectedCase.name || 'Patient';
+    const patientLang = selectedCase.language || 'English';
+    const rawLang = (selectedCase.language || '').toLowerCase();
+    const patientLang = rawLang.includes('hin') ? 'Hindi' : (rawLang.includes('tel') ? 'Telugu' : 'Tamil');
+
+    const prescriptionPayload = {
+      visit_id: visitId,
+      patient_name: patientName,
+      phone_number: patientPhone,
+      language: patientLang,
+      prescriptions: listToSend,
+      prescription: listToSend[0] || null,
+      next_appointment: nextAppointment,
+      nextAppointment: nextAppointment,
+    };
 
     try {
       if (isFirebaseConfigured) {
@@ -260,6 +361,8 @@ export default function DoctorDashboard() {
           {
             prescriptions: listToSend,
             prescription: listToSend[0] || null,
+            next_appointment: nextAppointment,
+            nextAppointment: nextAppointment,
             updated_at: serverTimestamp(),
           },
           { merge: true }
@@ -270,13 +373,20 @@ export default function DoctorDashboard() {
     }
 
     try {
+      await fetch(`${API_BASE_URL}/api/prescribe`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(prescriptionPayload),
+      });
+    } catch {
+      // Offline fallback
+    }
+
+    try {
       await fetch(`${API_BASE_URL}/visits/${encodeURIComponent(visitId)}/prescription`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          prescriptions: listToSend,
-          prescription: listToSend[0] || null,
-        }),
+        body: JSON.stringify(prescriptionPayload),
       });
     } catch {
       // Offline fallback
@@ -285,11 +395,7 @@ export default function DoctorDashboard() {
     try {
       localStorage.setItem(
         'caresync_latest_prescription',
-        JSON.stringify({
-          visit_id: visitId,
-          prescriptions: listToSend,
-          prescription: listToSend[0] || null,
-        })
+        JSON.stringify(prescriptionPayload)
       );
       if (typeof BroadcastChannel !== 'undefined') {
         const ch = new BroadcastChannel('caresync-prescription');
@@ -298,6 +404,8 @@ export default function DoctorDashboard() {
           visit_id: visitId,
           prescriptions: listToSend,
           prescription: listToSend[0] || null,
+          next_appointment: nextAppointment,
+          nextAppointment: nextAppointment,
         });
         ch.close();
       }
@@ -308,7 +416,7 @@ export default function DoctorDashboard() {
     setIsSendingPrescription(false);
     setPrescriptionNotice({
       ok: true,
-      message: `Prescription sent to Operator & Patient: ${listToSend.length} medicine(s) (${listToSend.map((m) => m.medicineName).join(', ')})`,
+      message: `Prescription sent to Operator & Patient: ${listToSend.length} medicine(s) (${listToSend.map((m) => m.medicineName).join(', ')})${nextAppointment ? ` • Next Appointment: ${nextAppointment}` : ''}`,
     });
   }
 
@@ -693,9 +801,26 @@ export default function DoctorDashboard() {
                             className="rounded-2xl border border-slate-200 bg-slate-50/70 p-4 space-y-4"
                           >
                             <div className="flex items-center justify-between border-b border-slate-200/80 pb-2">
-                              <span className="text-xs font-black uppercase tracking-wider text-slate-700">
-                                Medicine #{index + 1}
-                              </span>
+                              <div className="flex items-center gap-2">
+                                <span className="text-xs font-black uppercase tracking-wider text-slate-700">
+                                  Medicine #{index + 1}
+                                </span>
+                                {/* Phase 3: The "Teach-Back" Confirmation checkmark with Framer Motion spring */}
+                                <AnimatePresence>
+                                  {med.understood && (
+                                    <motion.span
+                                      initial={{ scale: 0, opacity: 0 }}
+                                      animate={{ scale: 1, opacity: 1 }}
+                                      exit={{ scale: 0, opacity: 0 }}
+                                      transition={{ type: 'spring', stiffness: 500, damping: 25 }}
+                                      className="inline-flex items-center gap-1.5 rounded-full bg-emerald-100 border border-emerald-300 px-2.5 py-0.5 text-xs font-black text-emerald-800 shadow-2xs"
+                                    >
+                                      <CheckCircle2 className="h-3.5 w-3.5 text-emerald-600" />
+                                      Patient Understood ✓
+                                    </motion.span>
+                                  )}
+                                </AnimatePresence>
+                              </div>
                               {prescriptions.length > 1 && (
                                 <button
                                   type="button"
@@ -832,6 +957,40 @@ export default function DoctorDashboard() {
                           </button>
                         </div>
 
+                        {/* Phase 2: Next Appointment Scheduler Section */}
+                        <div className="rounded-2xl border border-blue-200 bg-blue-50/50 p-4 space-y-2">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <label htmlFor="next-appointment-input" className="flex items-center gap-2 text-xs font-black uppercase tracking-wider text-slate-800">
+                              <Clock className="h-4 w-4 text-[#2563EB]" />
+                              Next Follow-Up Appointment
+                            </label>
+                            <span className="text-[10px] font-extrabold uppercase tracking-wider text-blue-700 bg-blue-100/80 px-2 py-0.5 rounded-md border border-blue-200">
+                              Automated Twilio SMS (1 Day &amp; 10 Min Before)
+                            </span>
+                          </div>
+                          <p className="text-[11px] text-slate-500 font-medium">
+                            Select date and time for patient follow-up review. APScheduler will queue automated SMS reminders in their native language.
+                          </p>
+                          <div className="pt-1 flex flex-wrap items-center gap-3">
+                            <input
+                              id="next-appointment-input"
+                              type="datetime-local"
+                              value={nextAppointment}
+                              onChange={(e) => setNextAppointment(e.target.value)}
+                              className="w-full sm:w-80 rounded-xl border border-slate-300 bg-white p-2.5 text-xs font-bold text-[#142D4E] focus:border-[#2563EB] focus:ring-2 focus:ring-blue-500/20 focus:outline-none shadow-2xs"
+                            />
+                            {nextAppointment && (
+                              <button
+                                type="button"
+                                onClick={() => setNextAppointment('')}
+                                className="text-xs text-slate-400 hover:text-slate-600 underline font-semibold cursor-pointer"
+                              >
+                                Clear
+                              </button>
+                            )}
+                          </div>
+                        </div>
+
                         {/* Send Prescription Button in Primary Blue */}
                         <div className="flex flex-wrap items-center justify-between gap-3 pt-3">
                           <p className="text-xs text-slate-500 font-medium">
@@ -850,9 +1009,46 @@ export default function DoctorDashboard() {
                         </div>
 
                         {prescriptionNotice && (
-                          <div className="flex items-center gap-2.5 rounded-xl border border-emerald-300 bg-emerald-50 p-3.5 text-xs font-bold text-emerald-900 shadow-xs">
-                            <CheckCircle2 className="h-4 w-4 text-emerald-600 shrink-0" />
-                            <span>{prescriptionNotice.message}</span>
+                          <div className="space-y-3 rounded-xl border border-emerald-300 bg-emerald-50/90 p-4 text-xs font-bold text-emerald-900 shadow-xs">
+                            <div className="flex items-center justify-between">
+                              <span className="flex items-center gap-2 font-black text-emerald-950">
+                                <CheckCircle2 className="h-4 w-4 text-emerald-600 shrink-0" />
+                                {prescriptionNotice.message}
+                              </span>
+                              <span className="text-[10px] font-extrabold uppercase tracking-wider text-emerald-700 bg-white/80 px-2 py-0.5 rounded-md border border-emerald-200">
+                                Live Teach-Back Tracker
+                              </span>
+                            </div>
+
+                            <div className="space-y-1.5 pt-1 border-t border-emerald-200/60">
+                              {prescriptions.map((med, idx) => (
+                                <div
+                                  key={idx}
+                                  className="flex items-center justify-between py-1.5 px-3 rounded-lg bg-white/80 border border-emerald-100"
+                                >
+                                  <span className="font-extrabold text-slate-800">
+                                    #{idx + 1} {med.medicineName || med.medicine_name || `Medicine ${idx + 1}`} ({med.dosage})
+                                  </span>
+
+                                  {med.understood ? (
+                                    <motion.span
+                                      initial={{ scale: 0 }}
+                                      animate={{ scale: 1 }}
+                                      transition={{ type: 'spring', stiffness: 500, damping: 25 }}
+                                      className="inline-flex items-center gap-1 text-emerald-700 font-black"
+                                    >
+                                      <CheckCircle2 className="h-3.5 w-3.5 text-emerald-600" />
+                                      Patient Understood ✓
+                                    </motion.span>
+                                  ) : (
+                                    <span className="text-amber-700 font-semibold text-[11px] flex items-center gap-1.5">
+                                      <span className="h-2 w-2 rounded-full bg-amber-400 animate-pulse"></span>
+                                      Awaiting Patient Teach-Back Confirmation...
+                                    </span>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
                           </div>
                         )}
                       </form>
